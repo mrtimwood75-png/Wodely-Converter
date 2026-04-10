@@ -759,55 +759,62 @@ def build_wodely_payloads(df: pd.DataFrame) -> list[dict[str, Any]]:
 
 
 
-def build_wodely_bulkcreate_url(raw_value: str, explicit_url: str = "") -> str:
-    explicit = clean(explicit_url).strip()
+
+def get_wodely_task_create_url() -> str:
+    explicit = get_setting("WODELY_TASK_CREATE_URL")
     if explicit:
         return explicit.rstrip("/")
+    return "https://api.wodely.com/v2/tasks"
 
-    base = clean(raw_value).strip()
-    if not base:
-        raise RuntimeError("Missing WODELY_API_URL")
-
-    base = base.rstrip("/")
-    lower = base.lower()
-
-    # If the full create endpoint is not supplied explicitly, fall back to the legacy path.
-    # If this returns 404, set WODELY_TASK_CREATE_URL in Streamlit secrets to the exact endpoint from your Wodely docs/admin.
-    if lower.endswith("/tasks/bulkcreate"):
-        return base
-    if lower.endswith("/tasks"):
-        return f"{base}/bulkcreate"
-    return f"{base}/tasks/bulkcreate"
 
 def push_preview_to_wodely(df: pd.DataFrame) -> dict[str, Any]:
-    base_url = get_setting("WODELY_API_URL")
+    url = get_wodely_task_create_url()
     api_key = get_setting("WODELY_API_KEY")
-    explicit_create_url = get_setting("WODELY_TASK_CREATE_URL")
     if not api_key:
         raise RuntimeError("Missing WODELY_API_KEY")
 
-    url = build_wodely_bulkcreate_url(base_url, explicit_create_url)
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
         "Authorization": f"Basic {api_key}",
     }
-    payloads = build_wodely_payloads(df)
-    response = requests.post(url, json=payloads, headers=headers, timeout=120)
-    try:
-        body = response.json()
-    except Exception:
-        body = {"raw": response.text}
 
-    if response.status_code == 404:
+    payloads = build_wodely_payloads(df)
+    successes: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+
+    for idx, payload in enumerate(payloads, start=1):
+        response = requests.post(url, json=payload, headers=headers, timeout=120)
+        try:
+            body = response.json()
+        except Exception:
+            body = {"raw": response.text}
+
+        row = {
+            "index": idx,
+            "orderId": payload.get("externalKey"),
+            "status_code": response.status_code,
+            "response": body,
+        }
+
+        if response.status_code >= 400:
+            failures.append(row)
+        else:
+            successes.append(row)
+
+    if failures:
         raise RuntimeError(
-            "Wodely returned 404 at endpoint "
-            + url
-            + ". Set WODELY_TASK_CREATE_URL in Streamlit secrets to the exact Create Tasks in Batch endpoint from your Wodely API docs/admin."
+            f"Wodely push failed for {len(failures)} of {len(payloads)} task(s). "
+            f"Endpoint: {url}. Failures: {failures}"
         )
-    if response.status_code >= 400:
-        raise RuntimeError(f"Wodely returned {response.status_code}. Endpoint: {url}. Response: {body}")
-    return {"payload_count": len(payloads), "endpoint": url, "response": body, "payload_preview": payloads[:3]}
+
+    return {
+        "ok": True,
+        "endpoint": url,
+        "payload_count": len(payloads),
+        "successes": successes,
+        "payload_preview": payloads[:3],
+    }
 
 
 # -----------------------
