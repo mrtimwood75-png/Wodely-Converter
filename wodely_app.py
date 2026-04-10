@@ -265,21 +265,28 @@ def bc_looks_like_order_id(value: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9\-/]*", txt))
 
 
+
 def bc_split_blocks(text: str) -> list[str]:
-    matches = list(re.finditer(r"Packinglist\s*-\s*Order", text, re.I))
-    if not matches:
+    packing_matches = list(re.finditer(r"Packinglist\s*-\s*Order", text, re.I))
+    if not packing_matches:
         return []
-    starts = [m.start() for m in matches]
+
+    account_starts = [m.start(1) for m in re.finditer(r"(?m)(^w-\d+\t)", text)]
+    if not account_starts:
+        return []
+
     blocks: list[str] = []
-    for i, start in enumerate(starts):
-        line_start = text.rfind("\n", 0, start)
-        line_start = 0 if line_start == -1 else line_start + 1
-        end = starts[i + 1] if i + 1 < len(starts) else len(text)
-        block = text[line_start:end].strip()
+    for i, pm in enumerate(packing_matches):
+        start_candidates = [pos for pos in account_starts if pos < pm.start()]
+        if not start_candidates:
+            continue
+        start = start_candidates[-1]
+        end_candidates = [pos for pos in account_starts if pos > pm.start()]
+        end = end_candidates[0] if end_candidates else len(text)
+        block = text[start:end].strip()
         if block:
             blocks.append(block)
     return blocks
-
 
 def bc_field(block: str, label: str, next_labels: list[str]) -> str:
     next_part = "|".join(re.escape(x) for x in next_labels)
@@ -288,50 +295,75 @@ def bc_field(block: str, label: str, next_labels: list[str]) -> str:
     return clean(match.group(1)) if match else ""
 
 
+
+def bc_tokens(block: str) -> list[str]:
+    raw_tokens = block.replace("\r", "").replace("\n", "\t").split("\t")
+    return [clean(tok) for tok in raw_tokens if clean(tok)]
+
+
 def bc_extract_header(block: str) -> dict[str, str]:
-    order_no = bc_field(block, "Sales order", ["Shop order", "Date", "Page", "IC-deliverymode", "Turn no.", "Car", "Week"])
-    if not bc_looks_like_order_id(order_no):
-        m = re.search(r"Sales order\t+([A-Za-z0-9\-/]*\d[A-Za-z0-9\-/]*)", block, re.I)
-        if m:
-            order_no = clean(m.group(1))
+    tokens = bc_tokens(block)
+
+    order_no = ""
+    customer_account = ""
+    customer_name = ""
+    sales_person = ""
+    delivery_date = ""
+    phone = ""
+    address = ""
+
+    if tokens:
+        first = tokens[0]
+        if re.fullmatch(r"[A-Za-z]-\d+", first):
+            customer_account = first
+    if len(tokens) > 1:
+        customer_name = tokens[1]
+
+    if "Australia" in tokens:
+        aus_idx = tokens.index("Australia")
+        addr_parts = []
+        start_idx = 2 if customer_account and customer_name else 0
+        for tok in tokens[start_idx:aus_idx]:
+            if tok.lower() in {"telephone", "mobile phone"}:
+                break
+            addr_parts.append(tok)
+        address = ", ".join([p for p in addr_parts if p])
+
+    for i, tok in enumerate(tokens):
+        low = tok.lower()
+        if low == "sales order" and i + 1 < len(tokens) and bc_looks_like_order_id(tokens[i + 1]):
+            order_no = tokens[i + 1]
+        elif low == "recipient" and i + 1 < len(tokens):
+            sales_person = tokens[i + 1]
+        elif low == "tour date" and i + 1 < len(tokens):
+            delivery_date = format_display_date(tokens[i + 1])
+        elif low == "customer account" and i + 1 < len(tokens):
+            customer_account = tokens[i + 1]
+        elif low == "name" and i + 1 < len(tokens):
+            customer_name = tokens[i + 1]
+        elif low == "telephone" and i + 1 < len(tokens):
+            if re.search(r"\d", tokens[i + 1]):
+                phone = tokens[i + 1]
+        elif low == "mobile phone" and i + 1 < len(tokens) and not phone:
+            if re.search(r"\d", tokens[i + 1]):
+                phone = tokens[i + 1]
+
     if not bc_looks_like_order_id(order_no):
         m = re.search(r"Sales\s*order\s*[:\-]?\s*([A-Za-z0-9\-/]*\d[A-Za-z0-9\-/]*)", block, re.I)
         if m:
             order_no = clean(m.group(1))
-    if not bc_looks_like_order_id(order_no):
-        order_no = ""
-
-    customer_account = bc_field(block, "Customer account", ["Name", "Location", "Pallet ID", "Quantity"])
-    customer_name = bc_field(block, "Name", ["Location", "Pallet ID", "Quantity", "Unit", "Item number"])
-    sales_person = bc_field(block, "Recipient", ["Tour date", "Customer account", "Name"])
-    delivery_date = bc_field(block, "Tour date", ["Customer account", "Name", "Location"])
-
-    phone = ""
-    m = re.search(r"Telephone\t+([0-9+ ]{6,})", block, re.I)
-    if m:
-        phone = clean(m.group(1))
-    if not phone:
-        m = re.search(r"Mobile phone\t+([0-9+ ]{6,})", block, re.I)
-        if m:
-            phone = clean(m.group(1))
-
-    address = ""
-    m = re.search(r"^[0-9+ ]+\t[^\t]+\t(.*?)\s+Australia", block, re.I | re.S | re.M)
-    if m:
-        address = clean(m.group(1))
 
     return {
-        "order_no": order_no,
-        "customer_account": customer_account,
-        "customer_name": customer_name,
-        "contact_name": customer_name,
-        "sales_person": sales_person,
-        "delivery_date": format_display_date(delivery_date),
-        "phone": phone,
+        "order_no": clean(order_no),
+        "customer_account": clean(customer_account),
+        "customer_name": clean(customer_name),
+        "contact_name": clean(customer_name),
+        "sales_person": clean(sales_person),
+        "delivery_date": clean(delivery_date),
+        "phone": clean(phone),
         "email": "",
-        "address": address,
+        "address": clean(address),
     }
-
 
 def bc_extract_note(block: str) -> str:
     lines = block.splitlines()
