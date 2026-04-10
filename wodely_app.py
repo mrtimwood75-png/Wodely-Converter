@@ -759,12 +759,20 @@ def build_wodely_payloads(df: pd.DataFrame) -> list[dict[str, Any]]:
 
 
 
-def build_wodely_bulkcreate_url(raw_value: str) -> str:
+def build_wodely_bulkcreate_url(raw_value: str, explicit_url: str = "") -> str:
+    explicit = clean(explicit_url).strip()
+    if explicit:
+        return explicit.rstrip("/")
+
     base = clean(raw_value).strip()
     if not base:
         raise RuntimeError("Missing WODELY_API_URL")
+
     base = base.rstrip("/")
     lower = base.lower()
+
+    # If the full create endpoint is not supplied explicitly, fall back to the legacy path.
+    # If this returns 404, set WODELY_TASK_CREATE_URL in Streamlit secrets to the exact endpoint from your Wodely docs/admin.
     if lower.endswith("/tasks/bulkcreate"):
         return base
     if lower.endswith("/tasks"):
@@ -774,12 +782,11 @@ def build_wodely_bulkcreate_url(raw_value: str) -> str:
 def push_preview_to_wodely(df: pd.DataFrame) -> dict[str, Any]:
     base_url = get_setting("WODELY_API_URL")
     api_key = get_setting("WODELY_API_KEY")
-    if not base_url:
-        raise RuntimeError("Missing WODELY_API_URL")
+    explicit_create_url = get_setting("WODELY_TASK_CREATE_URL")
     if not api_key:
         raise RuntimeError("Missing WODELY_API_KEY")
 
-    url = build_wodely_bulkcreate_url(base_url)
+    url = build_wodely_bulkcreate_url(base_url, explicit_create_url)
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
@@ -791,9 +798,16 @@ def push_preview_to_wodely(df: pd.DataFrame) -> dict[str, Any]:
         body = response.json()
     except Exception:
         body = {"raw": response.text}
+
+    if response.status_code == 404:
+        raise RuntimeError(
+            "Wodely returned 404 at endpoint "
+            + url
+            + ". Set WODELY_TASK_CREATE_URL in Streamlit secrets to the exact Create Tasks in Batch endpoint from your Wodely API docs/admin."
+        )
     if response.status_code >= 400:
-        raise RuntimeError(f"Wodely returned {response.status_code}. Response: {body}")
-    return {"payload_count": len(payloads), "response": body, "payload_preview": payloads[:3]}
+        raise RuntimeError(f"Wodely returned {response.status_code}. Endpoint: {url}. Response: {body}")
+    return {"payload_count": len(payloads), "endpoint": url, "response": body, "payload_preview": payloads[:3]}
 
 
 # -----------------------
