@@ -759,6 +759,18 @@ def build_wodely_payloads(df: pd.DataFrame) -> list[dict[str, Any]]:
 
 
 
+def build_wodely_bulkcreate_url(raw_value: str) -> str:
+    base = clean(raw_value).strip()
+    if not base:
+        raise RuntimeError("Missing WODELY_API_URL")
+    base = base.rstrip("/")
+    lower = base.lower()
+    if lower.endswith("/tasks/bulkcreate"):
+        return base
+    if lower.endswith("/tasks"):
+        return f"{base}/bulkcreate"
+    return f"{base}/tasks/bulkcreate"
+
 def push_preview_to_wodely(df: pd.DataFrame) -> dict[str, Any]:
     base_url = get_setting("WODELY_API_URL")
     api_key = get_setting("WODELY_API_KEY")
@@ -767,7 +779,7 @@ def push_preview_to_wodely(df: pd.DataFrame) -> dict[str, Any]:
     if not api_key:
         raise RuntimeError("Missing WODELY_API_KEY")
 
-    url = f"{base_url.rstrip('/')}/tasks/bulkcreate"
+    url = build_wodely_bulkcreate_url(base_url)
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
