@@ -4,7 +4,7 @@ import os
 import re
 import json
 from collections import defaultdict
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from html import escape
 from io import BytesIO
 from pathlib import Path
@@ -18,7 +18,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v35-automated-wodely-search-match"
+APP_VERSION = "2026-04-24-v37-wodely-date-range-sync"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -1100,6 +1100,7 @@ def get_wodely_task_list_url() -> str:
     if explicit:
         return explicit.rstrip("/")
 
+    # Wodely List Tasks endpoint per API support/docs.
     return "https://api.wodely.com/v2/tasks/search"
 
 
@@ -1122,7 +1123,8 @@ def extract_task_records(body: Any) -> list[dict[str, Any]]:
     if not isinstance(body, dict):
         return []
 
-    for key in ["tasks", "data", "items", "results", "records", "rows"]:
+    # Wodely responses may use any one of these wrapper names.
+    for key in ["tasks", "data", "items", "results", "records", "rows", "list"]:
         value = body.get(key)
         if isinstance(value, list):
             return [x for x in value if isinstance(x, dict)]
@@ -1241,9 +1243,6 @@ def extract_order_ids_from_task(task: dict[str, Any]) -> set[str]:
         if value:
             order_ids.add(normalize_order_id(value))
 
-    # Fallback extraction from the full task JSON:
-    # - BoConcept orders: os-007419
-    # - Transforma orders: 5-8 digit numbers such as 59118
     text_blob = flatten_json_text(task)
     for match in re.findall(r"\bos-\d+\b|\b\d{5,8}\b", text_blob, flags=re.I):
         order_ids.add(normalize_order_id(match))
@@ -1251,26 +1250,33 @@ def extract_order_ids_from_task(task: dict[str, Any]) -> set[str]:
     return order_ids
 
 
-def build_wodely_search_payloads(order_id: str, *, completed: bool = False, last_id: str = "") -> list[dict[str, Any]]:
-    order_id = clean(order_id)
+def wodely_lookup_date_range() -> tuple[str, str]:
+    start_dt = datetime.combine(date.today(), time(0, 0))
+    end_dt = datetime.combine(date.today() + timedelta(days=62), time(23, 59, 59))
 
-    # Wodely support advised searching List Tasks by External ID before creating.
-    # Different Wodely docs/screens refer to the same create-task field as either
-    # externalKey or External ID. These are the search forms we support.
+    return (
+        start_dt.isoformat() + "Z",
+        end_dt.isoformat() + "Z",
+    )
+
+
+def list_payload_variants(*, completed: bool, last_id: str = "") -> list[dict[str, Any]]:
+    start_dt, end_dt = wodely_lookup_date_range()
+
+    # Dynamic window: today through two months ahead.
+    # Nominal limit: 100 records.
     payloads: list[dict[str, Any]] = [
-        {"externalKey": order_id, "limit": 100},
-        {"externalId": order_id, "limit": 100},
-        {"search": order_id, "limit": 100},
-        {"searchText": order_id, "limit": 100},
+        {
+            "limit": 100,
+            "startDateTime": start_dt,
+            "endDateTime": end_dt,
+        }
     ]
 
+    # Completed historical tasks require taskStatusId "50".
     if completed:
         for payload in payloads:
-            payload.update({
-                "taskStatusId": "50",
-                "startDateTime": "2000-01-01T00:00:00Z",
-                "endDateTime": "2099-12-31T23:59:59Z",
-            })
+            payload["taskStatusId"] = "50"
 
     if last_id:
         for payload in payloads:
@@ -1279,139 +1285,142 @@ def build_wodely_search_payloads(order_id: str, *, completed: bool = False, last
     return payloads
 
 
-def search_wodely_tasks_for_order_id(order_id: str, *, completed: bool = False, progress_area=None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+def fetch_wodely_tasks_for_payload(payload_template: dict[str, Any], progress_area=None, label: str = "") -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     url = get_wodely_task_list_url()
     headers = get_wodely_headers()
 
-    found: list[dict[str, Any]] = []
+    all_tasks: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     samples: list[dict[str, Any]] = []
 
-    # Try the documented External ID search forms, but only accept a true local match.
-    # This prevents false positives when the API returns unfiltered task rows.
-    for payload_template in build_wodely_search_payloads(order_id, completed=completed):
-        last_id = ""
-        seen_last_ids: set[str] = set()
+    last_id = ""
+    seen_last_ids: set[str] = set()
 
-        for page_no in range(1, 11):
-            payload = dict(payload_template)
-            if last_id:
-                payload["lastId"] = last_id
+    for page_no in range(1, 51):
+        payload = dict(payload_template)
+        if last_id:
+            payload["lastId"] = last_id
 
-            status_label = "completed" if completed else "active/current"
-            if progress_area is not None:
-                search_field = next((k for k in ["externalKey", "externalId", "search", "searchText"] if k in payload), "payload")
-                progress_area.write(f"Searching Wodely {status_label} by {search_field}={order_id}, page {page_no}")
+        if progress_area is not None:
+            progress_area.write(f"Listing Wodely {label}: page {page_no}")
 
-            try:
-                response = requests.post(url, json=payload, headers=headers, timeout=45)
-            except Exception as exc:
-                errors.append({"url": url, "payload": payload, "error": str(exc)})
-                break
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=45)
+        except Exception as exc:
+            errors.append({"url": url, "payload": payload, "error": str(exc)})
+            break
 
-            try:
-                body = response.json()
-            except Exception:
-                body = {"raw": response.text}
+        try:
+            body = response.json()
+        except Exception:
+            body = {"raw": response.text}
 
-            if response.status_code >= 400:
-                errors.append({
-                    "url": url,
-                    "payload": payload,
-                    "status_code": response.status_code,
-                    "response": body,
-                })
-                break
+        if response.status_code >= 400:
+            errors.append({
+                "url": url,
+                "payload": payload,
+                "status_code": response.status_code,
+                "response": body,
+            })
+            break
 
-            tasks = extract_task_records(body)
-            if samples == []:
-                samples.append({
-                    "url": url,
-                    "payload": payload,
-                    "status_code": response.status_code,
-                    "response_keys": list(body.keys()) if isinstance(body, dict) else type(body).__name__,
-                    "task_count": len(tasks),
-                    "sample_task": tasks[0] if tasks else None,
-                })
+        tasks = extract_task_records(body)
 
-            if progress_area is not None:
-                progress_area.write(f"Wodely returned {len(tasks)} task record(s)")
+        if not samples:
+            samples.append({
+                "url": url,
+                "payload": payload,
+                "status_code": response.status_code,
+                "response_type": type(body).__name__,
+                "response_keys": list(body.keys()) if isinstance(body, dict) else [],
+                "task_count": len(tasks),
+                "lastId": response_last_id(body, tasks),
+                "sample_task": tasks[0] if tasks else None,
+            })
 
-            if not tasks:
-                break
+        if progress_area is not None:
+            progress_area.write(f"Returned {len(tasks)} task record(s)")
 
-            for task in tasks:
-                if task_is_cancelled(task):
-                    continue
+        if not tasks:
+            break
 
-                ids = extract_order_ids_from_task(task)
-                if normalize_order_id(order_id) in ids:
-                    found.append(task)
+        all_tasks.extend(tasks)
 
-            if found:
-                return found, errors, samples
+        next_last_id = response_last_id(body, tasks)
+        if not next_last_id or next_last_id in seen_last_ids:
+            break
 
-            next_last_id = response_last_id(body, tasks)
-            if not next_last_id or next_last_id in seen_last_ids:
-                break
+        seen_last_ids.add(next_last_id)
+        last_id = next_last_id
 
-            seen_last_ids.add(next_last_id)
-            last_id = next_last_id
-
-    return found, errors, samples
+    return all_tasks, errors, samples
 
 
-def list_existing_wodely_tasks(order_ids: list[str], progress_area=None) -> dict[str, Any]:
-    unique_order_ids = sorted({clean(order_id) for order_id in order_ids if clean(order_id)})
+def list_existing_wodely_tasks(order_ids: list[str] | None = None, progress_area=None) -> dict[str, Any]:
+    # Fetch Wodely tasks first, then match locally.
+    # Window: today through two months ahead.
+    # Limit: 100 records per request, paginated via lastId.
+
+    all_tasks: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    samples: list[dict[str, Any]] = []
+
+    start_dt, end_dt = wodely_lookup_date_range()
+
+    payload_sets = [
+        ("active/current date range", list_payload_variants(completed=False)[0]),
+        ("completed date range", list_payload_variants(completed=True)[0]),
+    ]
+
+    for label, payload in payload_sets:
+        tasks, payload_errors, payload_samples = fetch_wodely_tasks_for_payload(
+            payload,
+            progress_area=progress_area,
+            label=label,
+        )
+        all_tasks.extend(tasks)
+        errors.extend(payload_errors)
+        samples.extend(payload_samples)
+
+    non_cancelled_tasks = [task for task in all_tasks if not task_is_cancelled(task)]
 
     existing_order_ids: set[str] = set()
-    matched_rows: list[dict[str, Any]] = []
-    errors: list[dict[str, Any]] = []
-    samples: list[dict[str, Any]] = []
+    task_rows: list[dict[str, Any]] = []
 
-    if progress_area is not None:
-        progress_area.write(f"Checking {len(unique_order_ids)} preview order id(s) against Wodely")
+    for task in non_cancelled_tasks:
+        ids = extract_order_ids_from_task(task)
+        existing_order_ids.update(ids)
 
-    for idx, order_id in enumerate(unique_order_ids, start=1):
-        if progress_area is not None:
-            progress_area.write(f"Order {idx}/{len(unique_order_ids)}: {order_id}")
+        task_rows.append({
+            "TaskID": clean(task.get("id") or task.get("taskId") or task.get("taskID")),
+            "Recipient": clean(task.get("recipientName") or task.get("recipient")),
+            "Address": clean(task.get("destinationAddress") or task.get("address")),
+            "Status": task_status_text(task),
+            "ExtractedOrderIDs": ", ".join(sorted(ids)),
+        })
 
-        active_tasks, active_errors, active_samples = search_wodely_tasks_for_order_id(
-            order_id,
-            completed=False,
-            progress_area=progress_area,
-        )
-        errors.extend(active_errors)
-        samples.extend(active_samples)
+    requested_ids = {normalize_order_id(order_id) for order_id in (order_ids or []) if clean(order_id)}
+    matched_ids = sorted(existing_order_ids.intersection(requested_ids)) if requested_ids else sorted(existing_order_ids)
 
-        completed_tasks, completed_errors, completed_samples = search_wodely_tasks_for_order_id(
-            order_id,
-            completed=True,
-            progress_area=progress_area,
-        )
-        errors.extend(completed_errors)
-        samples.extend(completed_samples)
-
-        matches = active_tasks + completed_tasks
-
-        if matches:
-            existing_order_ids.add(order_id.lower())
-            matched_rows.append({
-                "OrderID": order_id,
-                "Matches": len(matches),
-                "Source": "Wodely non-cancelled active/current/completed tasks",
-            })
+    matched_rows = [{"OrderID": order_id, "Source": "Wodely non-cancelled task list"} for order_id in matched_ids]
 
     return {
         "endpoint": get_wodely_task_list_url(),
-        "checked_order_ids": unique_order_ids,
-        "checked_order_id_count": len(unique_order_ids),
+        "lookup_start": start_dt,
+        "lookup_end": end_dt,
+        "limit": 100,
+        "all_task_count": len(all_tasks),
+        "non_cancelled_task_count": len(non_cancelled_tasks),
         "existing_order_ids": sorted(existing_order_ids),
         "existing_order_id_count": len(existing_order_ids),
+        "matched_order_ids": matched_ids,
+        "matched_order_id_count": len(matched_ids),
         "matched_rows": matched_rows,
+        "task_rows": task_rows,
         "errors": errors[:10],
         "error_count": len(errors),
-        "samples": samples[:5],
+        "samples": samples[:8],
+        "working_payloads": [{"label": label, "payload": payload} for label, payload in payload_sets],
     }
 
 
@@ -1430,19 +1439,29 @@ def push_preview_to_wodely(
 
     preview_order_ids = sorted([clean(payload.get("externalKey")) for payload in payloads if clean(payload.get("externalKey"))])
 
+    list_result: dict[str, Any] | None = None
     if existing_order_ids is None:
         if progress_area is not None:
-            progress_area.write("No preloaded Wodely list supplied. Running automatic duplicate check now.")
+            progress_area.write("Running Wodely task list sync before creating anything.")
         list_result = list_existing_wodely_tasks(preview_order_ids, progress_area=progress_area)
-        existing_order_ids = set(list_result.get("existing_order_ids", []))
+        existing_order_ids = set(list_result.get("matched_order_ids", []))
+
+        # Safety: if Wodely has returned no tasks at all, the lookup is not working.
+        # Do not create tasks, because that is exactly how duplicates were produced.
+        if int(list_result.get("all_task_count", 0)) == 0:
+            raise RuntimeError(
+                "Wodely task listing returned zero tasks. Push stopped to prevent duplicates. "
+                "Open the Wodely lookup diagnostics below and check the endpoint/payload/response sample."
+            )
     else:
         list_result = {
             "existing_order_ids": sorted(existing_order_ids),
-            "existing_order_id_count": len(existing_order_ids),
-            "matched_rows": [],
+            "matched_order_ids": sorted(existing_order_ids),
+            "matched_order_id_count": len(existing_order_ids),
             "errors": [],
             "error_count": 0,
             "samples": [],
+            "task_rows": [],
         }
 
     seen_in_this_push: set[str] = set()
@@ -1450,7 +1469,7 @@ def push_preview_to_wodely(
 
     if progress_area is not None:
         progress_area.write(f"Prepared {len(payloads)} task(s)")
-        progress_area.write(f"Loaded {len(existing_order_ids)} existing Wodely order id(s) for duplicate checking")
+        progress_area.write(f"Matched {len(existing_order_ids)} existing Wodely order id(s) for duplicate checking")
 
     for idx, payload in enumerate(payloads, start=1):
         order_id = clean(payload.get("externalKey"))
@@ -1528,10 +1547,8 @@ def push_preview_to_wodely(
         "payload_count": len(payloads),
         "created_count": len(successes),
         "skipped_count": len(skipped),
-        "existing_wodely_order_count": len(existing_order_ids),
-        "lookup_error_count": list_result.get("error_count", 0),
-        "lookup_errors": list_result.get("errors", [])[:10],
-        "lookup_samples": list_result.get("samples", [])[:5],
+        "matched_wodely_order_count": len(existing_order_ids),
+        "lookup": list_result,
         "successes": successes,
         "skipped": skipped,
         "payload_preview": payloads[:3],
@@ -1642,9 +1659,9 @@ with actions[3]:
             preview_order_ids = sorted([x for x in preview_df["OrderID"].astype(str).str.strip().unique().tolist() if x])
             result = list_existing_wodely_tasks(preview_order_ids, progress_area=process_box)
             st.session_state.wodely_task_list_result = result
-            st.session_state.wodely_existing_order_ids = set(result.get("existing_order_ids", []))
+            st.session_state.wodely_existing_order_ids = set(result.get("matched_order_ids", []))
             process_box.success(
-                f"Found {result.get('existing_order_id_count', 0)} existing non-cancelled order id(s) from {result.get('checked_order_id_count', 0)} preview order id(s)."
+                f"Found {result.get('matched_order_id_count', 0)} matching existing non-cancelled order id(s) from the current preview."
             )
         except Exception as exc:
             st.session_state.wodely_task_list_result = {"error": str(exc)}
@@ -1679,8 +1696,12 @@ if st.session_state.wodely_task_list_result is not None:
         existing_ids = sorted(st.session_state.wodely_existing_order_ids)
         st.write({
             "endpoint": list_result.get("endpoint"),
-            "checked_order_id_count": list_result.get("checked_order_id_count"),
-            "existing_order_id_count": len(existing_ids),
+            "lookup_start": list_result.get("lookup_start"),
+            "lookup_end": list_result.get("lookup_end"),
+            "limit": list_result.get("limit"),
+            "all_task_count": list_result.get("all_task_count"),
+            "non_cancelled_task_count": list_result.get("non_cancelled_task_count"),
+            "matched_order_id_count": list_result.get("matched_order_id_count"),
             "error_count": list_result.get("error_count"),
         })
 
@@ -1690,7 +1711,15 @@ if st.session_state.wodely_task_list_result is not None:
         else:
             st.info("No matching non-cancelled Wodely tasks found for the current preview order IDs.")
 
+        with st.expander("Wodely task rows found", expanded=False):
+            task_rows = list_result.get("task_rows", [])
+            if task_rows:
+                st.dataframe(pd.DataFrame(task_rows), use_container_width=True, height=260)
+            else:
+                st.write("No task rows returned from Wodely.")
+
         with st.expander("Wodely lookup diagnostics", expanded=False):
+            st.write("Working payloads:", list_result.get("working_payloads", []))
             st.write("Errors:", list_result.get("errors", []))
             st.write("Samples:", list_result.get("samples", []))
 
