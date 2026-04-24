@@ -416,17 +416,21 @@ def bc_extract_items(block: str) -> list[dict[str, Any]]:
 
 
 def parse_boconcept_txt(uploaded_file) -> pd.DataFrame:
+    uploaded_file.seek(0)
     raw = uploaded_file.read()
 
     if isinstance(raw, bytes):
-        for enc in ["utf-8-sig", "utf-16", "utf-16-le", "cp1252"]:
-            try:
-                text = raw.decode(enc)
-                break
-            except UnicodeDecodeError:
-                continue
+        if raw.startswith((b"\\xff\\xfe", b"\\xfe\\xff")):
+            text = raw.decode("utf-16", errors="replace")
         else:
-            text = raw.decode("utf-8", errors="ignore")
+            for enc in ["utf-8-sig", "utf-8", "cp1252", "latin-1"]:
+                try:
+                    text = raw.decode(enc)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            else:
+                text = raw.decode("latin-1", errors="replace")
     else:
         text = str(raw)
 
