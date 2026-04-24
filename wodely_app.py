@@ -16,7 +16,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v13-transforma-first-contact-mobile"
+APP_VERSION = "2026-04-24-v14-transforma-balance-owing"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -103,6 +103,63 @@ def to_float(value: Any) -> float:
 
 def to_int(value: Any) -> int:
     return int(round(to_float(value)))
+
+
+def first_money_field(record: dict[str, Any], field_names: list[str]) -> tuple[str, float] | tuple[str, None]:
+    for field_name in field_names:
+        if field_name in record and clean(record.get(field_name)) != "":
+            return field_name, to_float(record.get(field_name))
+    return "", None
+
+
+def calculate_cod_amount(header: dict[str, Any]) -> float:
+    total_amount = to_float(header.get("TOTAMOUNT"))
+
+    # Prefer an explicit balance/outstanding field if the Options table exposes one.
+    # Some installations store payments separately from the order total.
+    balance_field, balance_value = first_money_field(
+        header,
+        [
+            "BALANCE",
+            "BALANCEOWING",
+            "BALANCE_OWING",
+            "OUTSTAND",
+            "OUTSTANDING",
+            "OUTSTANDINGAMOUNT",
+            "AMOUNTOUTSTANDING",
+            "CURBAL",
+            "CURRENTBALANCE",
+        ],
+    )
+    if balance_value is not None:
+        return max(balance_value, 0.0)
+
+    # Otherwise calculate balance owing from order total less all payment/credit fields found.
+    payment_fields = [
+        "PAID",
+        "TEMPPAID",
+        "TOTALPAYMENTS",
+        "TOTPAYMENTS",
+        "PAYMENTS",
+        "PAYMENT",
+        "TOTPAID",
+        "AMTPAID",
+        "AMOUNTPAID",
+        "PAIDAMT",
+        "PAIDAMOUNT",
+        "DEPOSIT",
+        "DEPOSITS",
+        "TOTCREDIT",
+        "CREDIT",
+        "CREDITS",
+    ]
+
+    payments_total = 0.0
+    for field_name in payment_fields:
+        if field_name in header and clean(header.get(field_name)) != "":
+            payments_total += to_float(header.get(field_name))
+
+    return max(total_amount - payments_total, 0.0)
 
 
 def join_non_blank(parts: list[Any], sep: str = ", ") -> str:
@@ -661,16 +718,85 @@ def fetch_lines_from_date(from_date: str) -> list[dict[str, str]]:
 
 def fetch_header(order_no: str) -> dict[str, str]:
     client_key = get_setting("OPTIONS_CLIENT_KEY")
+    base_fields = [
+        "ORDNO",
+        "ACCDE",
+        "AREA",
+        "CUSTNAME",
+        "DELNAME",
+        "CONTACT",
+        "DEL1",
+        "DEL2",
+        "DEL3",
+        "DEL4",
+        "TOTAMOUNT",
+        "PAID",
+        "TEMPPAID",
+        "IMESS",
+        "NOTES",
+        "SETUPNOTE",
+        "MAINTNOTE",
+        "DELNOTE",
+    ]
+
     xml_body = build_request_xml(
         client_key=client_key,
         table_name="DRSOTR",
-        fields=["ORDNO", "ACCDE", "AREA", "CUSTNAME", "DELNAME", "CONTACT", "DEL1", "DEL2", "DEL3", "DEL4", "TOTAMOUNT", "PAID", "TEMPPAID", "IMESS", "NOTES", "SETUPNOTE", "MAINTNOTE", "DELNOTE"],
+        fields=base_fields,
         conditions=[("ORDNO", "equals", clean(order_no))],
         sort_by="ORDNO",
         max_records=1,
     )
     records = parse_table_records(post_options_xml(xml_body), "DRSOTR")
-    return records[0] if records else {}
+    header = records[0] if records else {}
+
+    # Try optional payment/balance fields one at a time.
+    # Invalid fields are ignored so the app does not break if an Options field is absent.
+    optional_money_fields = [
+        "BALANCE",
+        "BALANCEOWING",
+        "BALANCE_OWING",
+        "OUTSTAND",
+        "OUTSTANDING",
+        "OUTSTANDINGAMOUNT",
+        "AMOUNTOUTSTANDING",
+        "CURBAL",
+        "CURRENTBALANCE",
+        "TOTALPAYMENTS",
+        "TOTPAYMENTS",
+        "PAYMENTS",
+        "PAYMENT",
+        "TOTPAID",
+        "AMTPAID",
+        "AMOUNTPAID",
+        "PAIDAMT",
+        "PAIDAMOUNT",
+        "DEPOSIT",
+        "DEPOSITS",
+        "TOTCREDIT",
+        "CREDIT",
+        "CREDITS",
+    ]
+
+    for field_name in optional_money_fields:
+        if field_name in header:
+            continue
+        try:
+            xml_body = build_request_xml(
+                client_key=client_key,
+                table_name="DRSOTR",
+                fields=["ORDNO", field_name],
+                conditions=[("ORDNO", "equals", clean(order_no))],
+                sort_by="ORDNO",
+                max_records=1,
+            )
+            extra_records = parse_table_records(post_options_xml(xml_body), "DRSOTR")
+            if extra_records and field_name in extra_records[0]:
+                header[field_name] = extra_records[0].get(field_name, "")
+        except Exception:
+            continue
+
+    return header
 
 
 def fetch_contact(accde: str, contact_name: str = "") -> dict[str, str]:
@@ -729,10 +855,7 @@ def extract_phone_from_text(*values: Any) -> str:
 def map_lines_to_preview_rows(order_no: str, lines: list[dict[str, str]], header: dict[str, str], contact: dict[str, str]) -> list[dict[str, Any]]:
     if not lines:
         return []
-    total_amount = to_float(header.get("TOTAMOUNT"))
-    paid = to_float(header.get("PAID"))
-    temp_paid = to_float(header.get("TEMPPAID"))
-    cod_amount = max(total_amount - paid - temp_paid, 0.0)
+    cod_amount = calculate_cod_amount(header)
 
     customer_account = clean(header.get("ACCDE")) or clean(lines[0].get("ACCDE"))
     recipient_name = clean(header.get("DELNAME")) or clean(header.get("CUSTNAME"))
