@@ -7,6 +7,7 @@ from collections import defaultdict
 from datetime import date, datetime, time
 from html import escape
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 import xml.etree.ElementTree as ET
@@ -17,7 +18,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v20-wodely-external-id-dedupe"
+APP_VERSION = "2026-04-24-v21-wodely-api-list-dedupe-ui-tidy"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -58,6 +59,53 @@ STYLE = """
 # -----------------------
 def get_setting(name: str, default: str = "") -> str:
     return str(st.secrets.get(name, os.getenv(name, default))).strip()
+
+
+def get_sent_orders_file() -> Path:
+    configured = get_setting("WODELY_SENT_ORDERS_FILE")
+    if configured:
+        return Path(configured)
+    return Path("wodely_sent_orders.csv")
+
+
+def load_sent_order_ids() -> set[str]:
+    path = get_sent_orders_file()
+    if not path.exists():
+        return set()
+
+    try:
+        df = pd.read_csv(path, dtype=str).fillna("")
+    except Exception:
+        return set()
+
+    if "OrderID" not in df.columns:
+        return set()
+
+    return set(df["OrderID"].astype(str).str.strip().str.lower())
+
+
+def record_sent_order(order_id: str, source: str, recipient_name: str, response_body: Any) -> None:
+    path = get_sent_orders_file()
+    row = pd.DataFrame([{
+        "OrderID": clean(order_id),
+        "Source": clean(source),
+        "Recipient Name": clean(recipient_name),
+        "PushedAt": datetime.now().isoformat(timespec="seconds"),
+        "WodelyResponse": json.dumps(response_body, default=str),
+    }])
+
+    if path.exists():
+        try:
+            existing = pd.read_csv(path, dtype=str).fillna("")
+            combined = pd.concat([existing, row], ignore_index=True)
+        except Exception:
+            combined = row
+    else:
+        combined = row
+
+    combined["_key"] = combined["OrderID"].astype(str).str.strip().str.lower()
+    combined = combined.drop_duplicates(subset=["_key"], keep="last").drop(columns=["_key"])
+    combined.to_csv(path, index=False)
 
 
 def clean(value: Any) -> str:
@@ -1035,33 +1083,50 @@ def get_wodely_task_create_url() -> str:
 
 
 def get_wodely_task_lookup_urls(order_id: str) -> list[str]:
-    order_id = clean(order_id)
-    explicit = get_setting("WODELY_TASK_LOOKUP_URL")
+    explicit = get_setting("WODELY_TASK_LIST_URL")
     if explicit:
-        return [explicit.rstrip("/").replace("{order_id}", quote(order_id, safe=""))]
+        return [explicit.rstrip("/")]
 
     base_url = get_wodely_task_create_url().rstrip("/")
-    encoded_order_id = quote(order_id, safe="")
 
-    # Wodely search/list endpoints vary between tenants/API versions.
-    # The app checks all likely external-id search styles plus broad task lists.
+    # Docs refer to "List tasks" using a JSON payload body. Tenants/API versions may expose it
+    # under either /list or /search, so try both once.
     return [
-        f"{base_url}?externalId={encoded_order_id}",
-        f"{base_url}?externalKey={encoded_order_id}",
-        f"{base_url}?external_id={encoded_order_id}",
-        f"{base_url}?external_key={encoded_order_id}",
-        f"{base_url}?orderId={encoded_order_id}",
-        f"{base_url}?order_id={encoded_order_id}",
-        f"{base_url}?search={encoded_order_id}",
-        f"{base_url}?keyword={encoded_order_id}",
-        f"{base_url}?q={encoded_order_id}",
-        f"{base_url}?status=active",
-        f"{base_url}?status=completed",
-        f"{base_url}?status=failed",
-        f"{base_url}?status=cancelled",
-        f"{base_url}",
-        f"{base_url}/{encoded_order_id}",
+        f"{base_url}/list",
+        f"{base_url}/search",
     ]
+
+
+def make_wodely_list_payloads(order_id: str) -> list[dict[str, Any]]:
+    order_id = clean(order_id)
+    start_dt = "2000-01-01T00:00:00Z"
+    end_dt = "2099-12-31T23:59:59Z"
+
+    base_payloads = [
+        {"searchText": order_id, "limit": 100},
+        {"externalId": order_id, "limit": 100},
+        {"externalKey": order_id, "limit": 100},
+        {"orderId": order_id, "limit": 100},
+        {"taskDesc": order_id, "limit": 100},
+    ]
+
+    payloads: list[dict[str, Any]] = []
+
+    for payload in base_payloads:
+        active_payload = payload.copy()
+        payloads.append(active_payload)
+
+        # Wodely docs: completed historical tasks require taskStatusId "50"
+        # and use startDateTime / endDateTime for completion timestamps.
+        completed_payload = payload.copy()
+        completed_payload.update({
+            "taskStatusId": "50",
+            "startDateTime": start_dt,
+            "endDateTime": end_dt,
+        })
+        payloads.append(completed_payload)
+
+    return payloads
 
 
 def extract_task_candidates(body: Any) -> list[Any]:
@@ -1094,7 +1159,6 @@ def text_has_exact_order_id(value: Any, order_id: str) -> bool:
     if value_text == order_id:
         return True
 
-    # Match order id as a standalone token inside fields such as taskDesc or sales order notes.
     return bool(re.search(rf"(?<![A-Za-z0-9]){re.escape(order_id)}(?![A-Za-z0-9])", value_text))
 
 
@@ -1102,7 +1166,6 @@ def body_contains_exact_external_id(body: Any, order_id: str) -> bool:
     order_id = clean(order_id)
 
     if isinstance(body, dict):
-        # Prefer true external-id fields.
         external_fields = [
             "externalId",
             "externalID",
@@ -1122,8 +1185,7 @@ def body_contains_exact_external_id(body: Any, order_id: str) -> bool:
             if field in body and text_has_exact_order_id(body.get(field), order_id):
                 return True
 
-        # Fallback for Wodely responses that do not expose the external-id field clearly.
-        # The app itself places the order id in taskDesc, package orderId, and sometimes notes.
+        # Fallback because Wodely may return task fields with different names.
         for field in ["taskDesc", "description", "salesOrderNotes", "notes", "tag1", "tag2", "tag3", "tag4"]:
             if field in body and text_has_exact_order_id(body.get(field), order_id):
                 return True
@@ -1138,47 +1200,58 @@ def body_contains_exact_external_id(body: Any, order_id: str) -> bool:
     return False
 
 
-def wodely_task_exists(order_id: str) -> bool:
+def wodely_task_exists(order_id: str) -> tuple[bool, str]:
+    order_id = clean(order_id)
+
+    if order_id.lower() in load_sent_order_ids():
+        return True, "local sent-orders register"
+
     api_key = get_setting("WODELY_API_KEY")
     if not api_key:
         raise RuntimeError("Missing WODELY_API_KEY")
 
-    order_id = clean(order_id)
-
     headers = {
+        "Content-Type": "application/json",
         "Accept": "application/json",
         "Authorization": f"Basic {api_key}",
     }
 
+    errors: list[dict[str, Any]] = []
+
     for url in get_wodely_task_lookup_urls(order_id):
-        try:
-            response = requests.get(url, headers=headers, timeout=30)
-        except Exception:
-            continue
+        for payload in make_wodely_list_payloads(order_id):
+            try:
+                response = requests.post(url, json=payload, headers=headers, timeout=30)
+            except Exception as exc:
+                errors.append({"url": url, "payload": payload, "error": str(exc)})
+                continue
 
-        if response.status_code == 404:
-            continue
+            try:
+                body = response.json()
+            except Exception:
+                body = {"raw": response.text}
 
-        try:
-            body = response.json()
-        except Exception:
-            body = {"raw": response.text}
+            if response.status_code == 404:
+                continue
 
-        if response.status_code >= 400:
-            continue
+            if response.status_code >= 400:
+                errors.append({
+                    "url": url,
+                    "payload": payload,
+                    "status_code": response.status_code,
+                    "response": body,
+                })
+                continue
 
-        # Only skip when this exact sales order number/external id is found in returned task data.
-        if body_contains_exact_external_id(body, order_id):
-            return True
+            if body_contains_exact_external_id(body, order_id):
+                return True, f"Wodely List Tasks endpoint: {url}"
 
-        # For filtered search endpoints, inspect the raw JSON string as a final guard.
-        # This catches Wodely field names that differ from the documented/expected names.
-        if "?" in url:
             body_text = json.dumps(body, default=str)
             if text_has_exact_order_id(body_text, order_id):
-                return True
+                return True, f"Wodely List Tasks endpoint text match: {url}"
 
-    return False
+    # If Wodely lookup endpoint is not available/configured, do not block creation.
+    return False, "no existing task found"
 
 
 def push_preview_to_wodely(df: pd.DataFrame) -> dict[str, Any]:
@@ -1198,15 +1271,29 @@ def push_preview_to_wodely(df: pd.DataFrame) -> dict[str, Any]:
     failures: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
 
+    seen_in_this_push: set[str] = set()
+
     for idx, payload in enumerate(payloads, start=1):
         order_id = clean(payload.get("externalKey"))
 
-        if wodely_task_exists(order_id):
+        if order_id.lower() in seen_in_this_push:
             skipped.append({
                 "index": idx,
                 "orderId": order_id,
                 "status_code": "SKIPPED",
-                "response": "Already exists in Wodely",
+                "response": "Duplicate within this push batch",
+            })
+            continue
+
+        seen_in_this_push.add(order_id.lower())
+
+        exists, exists_reason = wodely_task_exists(order_id)
+        if exists:
+            skipped.append({
+                "index": idx,
+                "orderId": order_id,
+                "status_code": "SKIPPED",
+                "response": f"Already exists: {exists_reason}",
             })
             continue
 
@@ -1227,6 +1314,12 @@ def push_preview_to_wodely(df: pd.DataFrame) -> dict[str, Any]:
             failures.append(row)
         else:
             successes.append(row)
+            record_sent_order(
+                order_id=order_id,
+                source=clean(payload.get("merchantId")),
+                recipient_name=clean(payload.get("recipientName")),
+                response_body=body,
+            )
 
     if failures:
         raise RuntimeError(
@@ -1251,7 +1344,7 @@ def push_preview_to_wodely(df: pd.DataFrame) -> dict[str, Any]:
 # -----------------------
 st.markdown(STYLE, unsafe_allow_html=True)
 st.title("Delivery to Wodely")
-st.caption("BoConcept packing list TXT + Transforma Options API -> one preview -> CSV export -> Wodely bulk create")
+st.caption("BoConcept Packing List - Order TXT + Transforma Options API -> preview -> CSV export -> Wodely create with duplicate protection")
 
 if "preview_df" not in st.session_state:
     st.session_state.preview_df = empty_preview_df()
@@ -1329,14 +1422,14 @@ with actions[1]:
     csv_bytes = prepare_preview_df(st.session_state.preview_df.copy()).to_csv(index=False).encode("utf-8-sig")
     st.download_button("Download CSV", data=csv_bytes, file_name="delivery_preview.csv", mime="text/csv", use_container_width=True)
 with actions[2]:
-    if st.button("Show Wodely payload", use_container_width=True):
+    if st.button("Show Wodely payload", use_container_width=True, disabled=preview_df.empty):
         try:
             payloads = build_wodely_payloads(st.session_state.preview_df.copy())
             st.session_state.push_result = {"preview_only": True, "payload_count": len(payloads), "payload_preview": payloads[:3]}
         except Exception as exc:
             st.session_state.push_result = {"error": str(exc)}
 with actions[3]:
-    if st.button("Push to Wodely", use_container_width=True, type="primary"):
+    if st.button("Push to Wodely", use_container_width=True, type="primary", disabled=preview_df.empty):
         try:
             st.session_state.push_result = push_preview_to_wodely(st.session_state.preview_df.copy())
             st.success("Pushed to Wodely.")
@@ -1347,6 +1440,8 @@ with actions[3]:
 with st.expander("Diagnostics", expanded=False):
     st.write("App version:", APP_VERSION)
     st.write("Preview columns:", list(st.session_state.preview_df.columns))
+    st.write("Sent-orders register:", str(get_sent_orders_file()))
+    st.write("Sent orders recorded:", len(load_sent_order_ids()))
     if not st.session_state.preview_df.empty:
         st.write("Blank OrderID rows:", int(st.session_state.preview_df["OrderID"].astype(str).str.strip().eq("").sum()))
         st.write("Orders in preview:", sorted([x for x in st.session_state.preview_df["OrderID"].astype(str).str.strip().unique().tolist() if x]))
