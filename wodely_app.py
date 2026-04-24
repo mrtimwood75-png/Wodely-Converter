@@ -18,7 +18,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v27-fixed-merchant-id-map"
+APP_VERSION = "2026-04-24-v28-safe-settings-merchant-id-map"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -58,7 +58,14 @@ STYLE = """
 # generic helpers
 # -----------------------
 def get_setting(name: str, default: str = "") -> str:
-    return str(st.secrets.get(name, os.getenv(name, default))).strip()
+    env_value = os.getenv(name)
+    if env_value is not None:
+        return str(env_value).strip()
+
+    try:
+        return str(st.secrets.get(name, default)).strip()
+    except Exception:
+        return str(default).strip()
 
 
 def get_sent_orders_file() -> Path:
@@ -1274,7 +1281,7 @@ def wodely_task_exists(order_id: str) -> tuple[bool, str]:
 
     api_key = get_setting("WODELY_API_KEY")
     if not api_key:
-        raise RuntimeError("Missing WODELY_API_KEY")
+        raise RuntimeError("Missing WODELY_API_KEY. Add it to Streamlit Secrets or environment variables.")
 
     headers = {
         "Content-Type": "application/json",
@@ -1324,7 +1331,7 @@ def push_preview_to_wodely(df: pd.DataFrame) -> dict[str, Any]:
     url = get_wodely_task_create_url()
     api_key = get_setting("WODELY_API_KEY")
     if not api_key:
-        raise RuntimeError("Missing WODELY_API_KEY")
+        raise RuntimeError("Missing WODELY_API_KEY. Add it to Streamlit Secrets or environment variables.")
 
     headers = {
         "Content-Type": "application/json",
