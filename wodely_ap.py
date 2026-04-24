@@ -18,7 +18,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v32-wodely-search-endpoint-dedupe"
+APP_VERSION = "2026-04-24-v33-two-step-wodely-task-list"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -1329,7 +1329,140 @@ def wodely_task_exists(order_id: str, progress_area=None) -> tuple[bool, str, li
     return False, "no non-cancelled task found for this External ID", active_errors + completed_errors
 
 
-def push_preview_to_wodely(df: pd.DataFrame, progress_area=None) -> dict[str, Any]:
+def extract_order_ids_from_task(task: dict[str, Any]) -> set[str]:
+    order_ids: set[str] = set()
+
+    if task_is_cancelled(task):
+        return order_ids
+
+    for field in [
+        "externalId",
+        "externalID",
+        "external_id",
+        "externalKey",
+        "external_key",
+        "orderId",
+        "orderID",
+        "order_id",
+    ]:
+        value = clean(task.get(field))
+        if value:
+            order_ids.add(value.lower())
+
+    packages = task.get("packages")
+    if isinstance(packages, list):
+        for package in packages:
+            if not isinstance(package, dict):
+                continue
+
+            for field in ["orderId", "orderID", "order_id"]:
+                value = clean(package.get(field))
+                if value:
+                    order_ids.add(value.lower())
+
+    return order_ids
+
+
+def build_wodely_bulk_search_payload(*, completed: bool = False, last_id: str = "") -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "limit": 100,
+    }
+
+    if completed:
+        payload.update({
+            "taskStatusId": "50",
+            "startDateTime": "2000-01-01T00:00:00Z",
+            "endDateTime": "2099-12-31T23:59:59Z",
+        })
+
+    if last_id:
+        payload["lastId"] = last_id
+
+    return payload
+
+
+def list_existing_wodely_tasks(progress_area=None) -> dict[str, Any]:
+    url = get_wodely_task_list_url()
+    headers = get_wodely_headers()
+
+    all_tasks: list[dict[str, Any]] = []
+    non_cancelled_tasks: list[dict[str, Any]] = []
+    existing_order_ids: set[str] = set()
+    errors: list[dict[str, Any]] = []
+
+    for completed in [False, True]:
+        last_id = ""
+        seen_last_ids: set[str] = set()
+        status_label = "completed" if completed else "active/current"
+
+        for page_no in range(1, 51):
+            payload = build_wodely_bulk_search_payload(completed=completed, last_id=last_id)
+
+            if progress_area is not None:
+                progress_area.write(f"Listing Wodely {status_label} tasks: page {page_no}")
+
+            try:
+                response = requests.post(url, json=payload, headers=headers, timeout=45)
+            except Exception as exc:
+                errors.append({"url": url, "payload": payload, "error": str(exc)})
+                break
+
+            try:
+                body = response.json()
+            except Exception:
+                body = {"raw": response.text}
+
+            if response.status_code >= 400:
+                errors.append({
+                    "url": url,
+                    "payload": payload,
+                    "status_code": response.status_code,
+                    "response": body,
+                })
+                break
+
+            tasks = extract_task_records(body)
+
+            if progress_area is not None:
+                progress_area.write(f"Returned {len(tasks)} task record(s)")
+
+            if not tasks:
+                break
+
+            for task in tasks:
+                all_tasks.append(task)
+
+                if task_is_cancelled(task):
+                    continue
+
+                non_cancelled_tasks.append(task)
+                existing_order_ids.update(extract_order_ids_from_task(task))
+
+            next_last_id = response_last_id(body, tasks)
+
+            if not next_last_id or next_last_id in seen_last_ids:
+                break
+
+            seen_last_ids.add(next_last_id)
+            last_id = next_last_id
+
+    return {
+        "endpoint": url,
+        "all_task_count": len(all_tasks),
+        "non_cancelled_task_count": len(non_cancelled_tasks),
+        "existing_order_ids": sorted(existing_order_ids),
+        "existing_order_id_count": len(existing_order_ids),
+        "errors": errors[:10],
+        "error_count": len(errors),
+        "sample_tasks": all_tasks[:3],
+    }
+
+
+def push_preview_to_wodely(
+    df: pd.DataFrame,
+    existing_order_ids: set[str],
+    progress_area=None,
+) -> dict[str, Any]:
     url = get_wodely_task_create_url()
     headers = get_wodely_headers()
 
@@ -1337,20 +1470,22 @@ def push_preview_to_wodely(df: pd.DataFrame, progress_area=None) -> dict[str, An
     successes: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
-    lookup_errors: list[dict[str, Any]] = []
 
     seen_in_this_push: set[str] = set()
+    existing_order_ids = {clean(order_id).lower() for order_id in existing_order_ids if clean(order_id)}
 
     if progress_area is not None:
-        progress_area.write(f"Prepared {len(payloads)} task(s). Starting Wodely External ID checks.")
+        progress_area.write(f"Prepared {len(payloads)} task(s)")
+        progress_area.write(f"Loaded {len(existing_order_ids)} existing Wodely order id(s) for duplicate checking")
 
     for idx, payload in enumerate(payloads, start=1):
         order_id = clean(payload.get("externalKey"))
+        order_key = order_id.lower()
 
         if progress_area is not None:
-            progress_area.write(f"Task {idx}/{len(payloads)}: {order_id}")
+            progress_area.write(f"Processing {idx}/{len(payloads)}: {order_id}")
 
-        if order_id.lower() in seen_in_this_push:
+        if order_key in seen_in_this_push:
             skipped.append({
                 "index": idx,
                 "orderId": order_id,
@@ -1361,20 +1496,17 @@ def push_preview_to_wodely(df: pd.DataFrame, progress_area=None) -> dict[str, An
                 progress_area.write(f"Skipped {order_id}: duplicate within this push batch")
             continue
 
-        seen_in_this_push.add(order_id.lower())
+        seen_in_this_push.add(order_key)
 
-        exists, exists_reason, errors = wodely_task_exists(order_id, progress_area=progress_area)
-        lookup_errors.extend(errors)
-
-        if exists:
+        if order_key in existing_order_ids:
             skipped.append({
                 "index": idx,
                 "orderId": order_id,
                 "status_code": "SKIPPED",
-                "response": f"Already exists in Wodely: {exists_reason}",
+                "response": "Already exists in listed Wodely non-cancelled tasks",
             })
             if progress_area is not None:
-                progress_area.write(f"Skipped {order_id}: {exists_reason}")
+                progress_area.write(f"Skipped {order_id}: already exists in Wodely task list")
             continue
 
         if progress_area is not None:
@@ -1399,6 +1531,7 @@ def push_preview_to_wodely(df: pd.DataFrame, progress_area=None) -> dict[str, An
                 progress_area.write(f"Failed {order_id}: HTTP {response.status_code}")
         else:
             successes.append(row)
+            existing_order_ids.add(order_key)
             record_sent_order(
                 order_id=order_id,
                 source=clean(payload.get("merchantId")),
@@ -1417,12 +1550,10 @@ def push_preview_to_wodely(df: pd.DataFrame, progress_area=None) -> dict[str, An
     return {
         "ok": True,
         "endpoint": url,
-        "search_endpoint": get_wodely_task_list_url(),
         "payload_count": len(payloads),
         "created_count": len(successes),
         "skipped_count": len(skipped),
-        "lookup_error_count": len(lookup_errors),
-        "lookup_errors": lookup_errors[:10],
+        "existing_wodely_order_count": len(existing_order_ids),
         "successes": successes,
         "skipped": skipped,
         "payload_preview": payloads[:3],
@@ -1440,6 +1571,10 @@ if "preview_df" not in st.session_state:
     st.session_state.preview_df = empty_preview_df()
 if "push_result" not in st.session_state:
     st.session_state.push_result = None
+if "wodely_existing_order_ids" not in st.session_state:
+    st.session_state.wodely_existing_order_ids = set()
+if "wodely_task_list_result" not in st.session_state:
+    st.session_state.wodely_task_list_result = None
 
 left, right = st.columns([1, 1])
 
@@ -1502,15 +1637,17 @@ edited = st.data_editor(
 )
 st.session_state.preview_df = prepare_preview_df(edited)
 
-actions = st.columns([1, 1, 1, 1])
+actions = st.columns([1, 1, 1, 1, 1])
 with actions[0]:
     if st.button("Clear preview", use_container_width=True):
         st.session_state.preview_df = empty_preview_df()
         st.session_state.push_result = None
         st.rerun()
+
 with actions[1]:
     csv_bytes = prepare_preview_df(st.session_state.preview_df.copy()).to_csv(index=False).encode("utf-8-sig")
     st.download_button("Download CSV", data=csv_bytes, file_name="delivery_preview.csv", mime="text/csv", use_container_width=True)
+
 with actions[2]:
     if st.button("Show Wodely payload", use_container_width=True, disabled=preview_df.empty):
         try:
@@ -1518,13 +1655,33 @@ with actions[2]:
             st.session_state.push_result = {"preview_only": True, "payload_count": len(payloads), "payload_preview": payloads[:3]}
         except Exception as exc:
             st.session_state.push_result = {"error": str(exc)}
+
 with actions[3]:
-    if st.button("Push to Wodely", use_container_width=True, type="primary", disabled=preview_df.empty):
+    if st.button("List Existing Wodely Tasks", use_container_width=True):
         process_box = st.container(border=True)
-        process_box.markdown("### Process")
+        process_box.markdown("### Wodely Task Listing")
+        try:
+            result = list_existing_wodely_tasks(progress_area=process_box)
+            st.session_state.wodely_task_list_result = result
+            st.session_state.wodely_existing_order_ids = set(result.get("existing_order_ids", []))
+            process_box.success(
+                f"Loaded {result.get('existing_order_id_count', 0)} existing non-cancelled order id(s)."
+            )
+        except Exception as exc:
+            st.session_state.wodely_task_list_result = {"error": str(exc)}
+            st.session_state.wodely_existing_order_ids = set()
+            process_box.error(str(exc))
+            st.error(str(exc))
+
+with actions[4]:
+    list_ready = bool(st.session_state.wodely_existing_order_ids) or st.session_state.wodely_task_list_result is not None
+    if st.button("Push to Wodely", use_container_width=True, type="primary", disabled=preview_df.empty or not list_ready):
+        process_box = st.container(border=True)
+        process_box.markdown("### Push Process")
         try:
             st.session_state.push_result = push_preview_to_wodely(
                 st.session_state.preview_df.copy(),
+                existing_order_ids=set(st.session_state.wodely_existing_order_ids),
                 progress_area=process_box,
             )
             process_box.success("Process complete.")
@@ -1534,6 +1691,22 @@ with actions[3]:
             process_box.error(str(exc))
             st.error(str(exc))
 
+if st.session_state.wodely_task_list_result is not None:
+    st.markdown("### Existing Wodely Tasks")
+    list_result = st.session_state.wodely_task_list_result
+    if isinstance(list_result, dict) and "error" in list_result:
+        st.error(list_result["error"])
+    else:
+        existing_ids = sorted(st.session_state.wodely_existing_order_ids)
+        st.write({
+            "endpoint": list_result.get("endpoint"),
+            "all_task_count": list_result.get("all_task_count"),
+            "non_cancelled_task_count": list_result.get("non_cancelled_task_count"),
+            "existing_order_id_count": len(existing_ids),
+            "error_count": list_result.get("error_count"),
+        })
+        st.dataframe(pd.DataFrame({"Existing Wodely OrderID": existing_ids}), use_container_width=True, height=220)
+
 with st.expander("Diagnostics", expanded=False):
     st.write("App version:", APP_VERSION)
     st.write("Merchant mapping:", {"BoConcept Adelaide": "954bc139-aade-4a41-8e8f-23b5c50b1cc2", "Transforma": "8644fbc2-0420-4b54-8521-64c02a341949"})
@@ -1542,6 +1715,7 @@ with st.expander("Diagnostics", expanded=False):
     st.write("Wodely task search endpoint:", get_wodely_task_list_url())
     st.write("Sent-orders register:", str(get_sent_orders_file()))
     st.write("Sent orders recorded for audit only:", len(load_sent_order_ids()))
+    st.write("Loaded Wodely existing order IDs:", len(st.session_state.wodely_existing_order_ids))
     if not st.session_state.preview_df.empty:
         st.write("Blank OrderID rows:", int(st.session_state.preview_df["OrderID"].astype(str).str.strip().eq("").sum()))
         st.write("Orders in preview:", sorted([x for x in st.session_state.preview_df["OrderID"].astype(str).str.strip().unique().tolist() if x]))
