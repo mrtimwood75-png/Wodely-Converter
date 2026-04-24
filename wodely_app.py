@@ -16,7 +16,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v16-payments-from-drtran-drhist"
+APP_VERSION = "2026-04-24-v17-strict-wodely-duplicate-check"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -1014,12 +1014,41 @@ def get_wodely_task_lookup_url(order_id: str) -> str:
     return f"{get_wodely_task_create_url()}/{order_id}"
 
 
+def body_contains_exact_external_key(body: Any, order_id: str) -> bool:
+    order_id = clean(order_id)
+
+    if isinstance(body, dict):
+        external_key = clean(
+            body.get("externalKey")
+            or body.get("external_key")
+            or body.get("orderId")
+            or body.get("order_id")
+        )
+        if external_key == order_id:
+            return True
+
+        for key in ["data", "item", "task", "result"]:
+            if key in body and body_contains_exact_external_key(body[key], order_id):
+                return True
+
+        for key in ["items", "results", "tasks"]:
+            if key in body and isinstance(body[key], list):
+                return any(body_contains_exact_external_key(item, order_id) for item in body[key])
+
+    if isinstance(body, list):
+        return any(body_contains_exact_external_key(item, order_id) for item in body)
+
+    return False
+
+
 def wodely_task_exists(order_id: str) -> bool:
     api_key = get_setting("WODELY_API_KEY")
     if not api_key:
         raise RuntimeError("Missing WODELY_API_KEY")
 
-    url = get_wodely_task_lookup_url(clean(order_id))
+    order_id = clean(order_id)
+    url = get_wodely_task_lookup_url(order_id)
+
     headers = {
         "Accept": "application/json",
         "Authorization": f"Basic {api_key}",
@@ -1027,27 +1056,23 @@ def wodely_task_exists(order_id: str) -> bool:
 
     response = requests.get(url, headers=headers, timeout=30)
 
-    if response.status_code == 200:
-        return True
-
     if response.status_code == 404:
         return False
 
-    # Some APIs use a search-style endpoint and return an empty list/object.
     try:
         body = response.json()
-        if response.status_code < 400:
-            if body in ({}, [], None):
-                return False
-            if isinstance(body, dict):
-                for key in ["data", "items", "results", "tasks"]:
-                    if key in body and isinstance(body[key], list):
-                        return len(body[key]) > 0
-                return True
     except Exception:
-        body = response.text
+        body = {"raw": response.text}
 
-    raise RuntimeError(f"Wodely lookup failed for {order_id}. Endpoint: {url}. Status: {response.status_code}. Response: {body}")
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Wodely lookup failed for {order_id}. "
+            f"Endpoint: {url}. Status: {response.status_code}. Response: {body}"
+        )
+
+    # Critical: do NOT treat any HTTP 200 as "exists".
+    # Only skip when the lookup response explicitly contains this exact externalKey/orderId.
+    return body_contains_exact_external_key(body, order_id)
 
 
 def push_preview_to_wodely(df: pd.DataFrame) -> dict[str, Any]:
