@@ -38,7 +38,7 @@ OUTPUT_COLUMNS = [
 ]
 
 EXCLUDED_TRANSFORMA_SKUS = {"ZHEADING", "ZDELIVERY", "ZDISCOUNT", "ZDESIGNREBATE"}
-EXCLUDED_BOCONCEPT_SKUS = {"99912", "99920"}
+EXCLUDED_BOCONCEPT_SKUS = {"99920"}
 
 STYLE = """
 <style>
@@ -267,28 +267,25 @@ def bc_looks_like_order_id(value: str) -> bool:
 
 
 def bc_split_blocks(text: str) -> list[str]:
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    packing_matches = list(re.finditer(r"Packinglist\s*-\s*Order", text, re.I))
+    if not packing_matches:
+        return []
 
-    starts = [
-        m.start()
-        for m in re.finditer(
-            r"(?m)^\s*[A-Za-z0-9][A-Za-z0-9\-/]{1,40}\t",
-            text,
-        )
-    ]
-
-    if not starts:
+    account_starts = [m.start(1) for m in re.finditer(r"(?m)(^w-\d+\t)", text)]
+    if not account_starts:
         return []
 
     blocks: list[str] = []
-
-    for i, start in enumerate(starts):
-        end = starts[i + 1] if i + 1 < len(starts) else len(text)
+    for i, pm in enumerate(packing_matches):
+        start_candidates = [pos for pos in account_starts if pos < pm.start()]
+        if not start_candidates:
+            continue
+        start = start_candidates[-1]
+        end_candidates = [pos for pos in account_starts if pos > pm.start()]
+        end = end_candidates[0] if end_candidates else len(text)
         block = text[start:end].strip()
-
-        if re.search(r"Packing\s*list\s*-\s*Order|Packinglist\s*-\s*Order", block, re.I):
+        if block:
             blocks.append(block)
-
     return blocks
 
 def bc_field(block: str, label: str, next_labels: list[str]) -> str:
@@ -417,19 +414,7 @@ def bc_extract_items(block: str) -> list[dict[str, Any]]:
 
 def parse_boconcept_txt(uploaded_file) -> pd.DataFrame:
     raw = uploaded_file.read()
-
-    if isinstance(raw, bytes):
-        for enc in ["utf-8-sig", "utf-16", "utf-16-le", "cp1252"]:
-            try:
-                text = raw.decode(enc)
-                break
-            except UnicodeDecodeError:
-                continue
-        else:
-            text = raw.decode("utf-8", errors="ignore")
-    else:
-        text = str(raw)
-
+    text = raw.decode("utf-8", errors="ignore") if isinstance(raw, bytes) else str(raw)
     if not text.strip():
         return empty_preview_df()
     blocks = bc_split_blocks(text)
