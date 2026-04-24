@@ -16,7 +16,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v10-two-row-button-layout"
+APP_VERSION = "2026-04-24-v11-remove-contact-name"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -26,7 +26,6 @@ OUTPUT_COLUMNS = [
     "OrderID",
     "Customer Account",
     "Recipient Name",
-    "Contact Name",
     "Phone",
     "Email",
     "Address",
@@ -194,7 +193,6 @@ def normalize_preview_schema(df: pd.DataFrame) -> pd.DataFrame:
         "OrderID": ["Order ID", "Order Id", "Order No", "Order Number", "Sales Order", "Sales order", "ORDNO", "order_no"],
         "Customer Account": ["CustomerAccount", "Customer Code", "Account", "ACCDE"],
         "Recipient Name": ["Recipient", "RecipientName", "Customer", "Customer Name", "DELNAME", "CUSTNAME"],
-        "Contact Name": ["Contact", "ContactName", "NAME"],
         "Phone": ["Mobile", "Mobile phone", "Telephone", "MOBILE"],
         "Email": ["EMAIL", "E-mail"],
         "Address": ["Delivery Address", "DELADDRESS", "Full Address"],
@@ -399,7 +397,6 @@ def bc_extract_header(block: str) -> dict[str, str]:
         "order_no": clean(order_no),
         "customer_account": clean(customer_account),
         "customer_name": clean(customer_name),
-        "contact_name": clean(customer_name),
         "sales_person": clean(sales_person),
         "delivery_date": clean(delivery_date),
         "phone": clean(phone),
@@ -542,7 +539,6 @@ def parse_boconcept_txt(uploaded_file) -> pd.DataFrame:
                 "OrderID": order_id,
                 "Customer Account": clean(header.get("customer_account")),
                 "Recipient Name": clean(header.get("customer_name")),
-                "Contact Name": clean(header.get("contact_name")),
                 "Phone": clean(header.get("phone")),
                 "Email": clean(header.get("email")),
                 "Address": clean(header.get("address")),
@@ -682,7 +678,7 @@ def fetch_contact(accde: str) -> dict[str, str]:
     xml_body = build_request_xml(
         client_key=client_key,
         table_name="DRSCON",
-        fields=["ACCDE", "NAME", "MOBILE", "EMAIL"],
+        fields=["ACCDE", "MOBILE", "EMAIL"],
         conditions=[("ACCDE", "equals", clean(accde))],
         sort_by="ACCDE",
         max_records=1,
@@ -701,7 +697,6 @@ def map_lines_to_preview_rows(order_no: str, lines: list[dict[str, str]], header
 
     customer_account = clean(header.get("ACCDE")) or clean(lines[0].get("ACCDE"))
     recipient_name = clean(header.get("DELNAME")) or clean(header.get("CUSTNAME"))
-    contact_name = clean(contact.get("NAME")) or clean(header.get("CONTACT"))
     phone = clean(contact.get("MOBILE"))
     email = clean(contact.get("EMAIL"))
     full_address = join_non_blank([header.get("DEL1"), header.get("DEL2"), header.get("DEL3"), header.get("DEL4")])
@@ -722,7 +717,6 @@ def map_lines_to_preview_rows(order_no: str, lines: list[dict[str, str]], header
             "OrderID": clean(order_no),
             "Customer Account": customer_account,
             "Recipient Name": recipient_name,
-            "Contact Name": contact_name,
             "Phone": phone,
             "Email": email,
             "Address": full_address,
@@ -820,7 +814,7 @@ def build_wodely_payloads(df: pd.DataFrame) -> list[dict[str, Any]]:
             get_group_value(group, "Delivery Window"),
         )
         merchant_name = clean(get_group_value(group, "Merchant"))
-        recipient_name = get_group_value(group, "Recipient Name", "Customer")
+        recipient_name = get_group_value(group, "Recipient Name")
         recipient_email = get_group_value(group, "Email")
         recipient_phone = get_group_value(group, "Phone")
         destination_address = get_group_value(group, "Address")
