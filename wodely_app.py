@@ -16,6 +16,8 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
+APP_VERSION = "2026-04-24-v4-boconcept-parser-diagnostics"
+
 OUTPUT_COLUMNS = [
     "COD (money)",
     "Service Time",
@@ -269,13 +271,36 @@ def bc_looks_like_order_id(value: str) -> bool:
 def bc_split_blocks(text: str) -> list[str]:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    starts = [
-        m.start()
-        for m in re.finditer(
-            r"(?m)^\s*[A-Za-z0-9][A-Za-z0-9\-/]{1,40}\t",
-            text,
-        )
-    ]
+    # A true customer/order block starts with the customer code line.
+    # In this report the address may continue over the next lines, and
+    # "Packinglist - Order" appears a few lines later.
+    # Do not treat rows like Australia, Location, Receipt, or Total volume as block starts.
+    lines = text.splitlines(keepends=True)
+    starts: list[int] = []
+    pos = 0
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+
+        if not stripped:
+            pos += len(line)
+            continue
+
+        first_field = stripped.split("\t", 1)[0].strip().lower()
+
+        if first_field in {"australia", "location", "receipt", "total volume"}:
+            pos += len(line)
+            continue
+
+        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9\-/]{1,40}\t", line.strip()):
+            pos += len(line)
+            continue
+
+        lookahead = "".join(lines[idx: idx + 6])
+        if re.search(r"Packing\s*list\s*-\s*Order|Packinglist\s*-\s*Order", lookahead, re.I):
+            starts.append(pos)
+
+        pos += len(line)
 
     if not starts:
         return []
@@ -415,12 +440,56 @@ def bc_extract_items(block: str) -> list[dict[str, Any]]:
     return items
 
 
+def debug_boconcept_txt(uploaded_file) -> dict[str, Any]:
+    uploaded_file.seek(0)
+    raw = uploaded_file.read()
+    uploaded_file.seek(0)
+
+    if isinstance(raw, bytes):
+        if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+            text = raw.decode("utf-16", errors="replace")
+        else:
+            for enc in ["utf-8-sig", "utf-8", "cp1252", "latin-1"]:
+                try:
+                    text = raw.decode(enc)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            else:
+                text = raw.decode("latin-1", errors="replace")
+    else:
+        text = str(raw)
+
+    blocks = bc_split_blocks(text)
+    item_counts = [len(bc_extract_items(block)) for block in blocks]
+    order_ids = []
+    for block in blocks:
+        header = bc_extract_header(block)
+        items = bc_extract_items(block)
+        order_id = clean(header.get("order_no"))
+        if not order_id:
+            order_id = clean(next((item.get("sales_order") for item in items if clean(item.get("sales_order"))), ""))
+        if order_id:
+            order_ids.append(order_id)
+
+    return {
+        "file_bytes": len(raw) if isinstance(raw, bytes) else len(str(raw)),
+        "text_chars": len(text),
+        "contains_packinglist_order": bool(re.search(r"Packing\s*list\s*-\s*Order|Packinglist\s*-\s*Order", text, re.I)),
+        "blocks_found": len(blocks),
+        "item_counts_per_block": item_counts,
+        "total_items_found": sum(item_counts),
+        "order_ids_found": order_ids,
+        "first_300_chars": text[:300],
+    }
+
+
 def parse_boconcept_txt(uploaded_file) -> pd.DataFrame:
     uploaded_file.seek(0)
     raw = uploaded_file.read()
 
     if isinstance(raw, bytes):
-        if raw.startswith((b"\\xff\\xfe", b"\\xfe\\xff")):
+        if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
             text = raw.decode("utf-16", errors="replace")
         else:
             for enc in ["utf-8-sig", "utf-8", "cp1252", "latin-1"]:
@@ -859,7 +928,8 @@ with left:
                 raise RuntimeError("Upload a BoConcept TXT file first.")
             bc_df = parse_boconcept_txt(bc_file)
             if bc_df.empty:
-                raise RuntimeError("No BoConcept rows found in the uploaded file.")
+                diagnostics = debug_boconcept_txt(bc_file)
+                raise RuntimeError(f"No BoConcept rows found in the uploaded file. Diagnostics: {json.dumps(diagnostics, indent=2)}")
             st.session_state.preview_df = append_preview(st.session_state.preview_df, bc_df)
             st.success(f"Added {len(bc_df)} BoConcept rows.")
         except Exception as exc:
@@ -927,6 +997,7 @@ with actions[3]:
             st.error(str(exc))
 
 with st.expander("Diagnostics", expanded=False):
+    st.write("App version:", APP_VERSION)
     st.write("Preview columns:", list(st.session_state.preview_df.columns))
     if not st.session_state.preview_df.empty:
         st.write("Blank OrderID rows:", int(st.session_state.preview_df["OrderID"].astype(str).str.strip().eq("").sum()))
