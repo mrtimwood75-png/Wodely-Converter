@@ -18,7 +18,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v21-wodely-api-list-dedupe-ui-tidy"
+APP_VERSION = "2026-04-24-v22-ignore-deleted-wodely-tasks"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -1162,10 +1162,61 @@ def text_has_exact_order_id(value: Any, order_id: str) -> bool:
     return bool(re.search(rf"(?<![A-Za-z0-9]){re.escape(order_id)}(?![A-Za-z0-9])", value_text))
 
 
+def is_deleted_or_cancelled_task(task: Any) -> bool:
+    if not isinstance(task, dict):
+        return False
+
+    deleted_flags = [
+        task.get("deleted"),
+        task.get("isDeleted"),
+        task.get("is_deleted"),
+        task.get("archived"),
+        task.get("isArchived"),
+        task.get("is_archived"),
+    ]
+
+    for value in deleted_flags:
+        if str(value).strip().lower() in {"true", "1", "yes", "y"}:
+            return True
+
+    status_text = " ".join(
+        clean(task.get(field))
+        for field in [
+            "status",
+            "taskStatus",
+            "taskStatusName",
+            "statusName",
+            "task_status",
+            "task_status_name",
+        ]
+        if clean(task.get(field))
+    ).lower()
+
+    if any(word in status_text for word in ["deleted", "cancelled", "canceled"]):
+        return True
+
+    status_id = clean(
+        task.get("taskStatusId")
+        or task.get("statusId")
+        or task.get("task_status_id")
+        or task.get("status_id")
+    )
+
+    # Wodely docs identify completed as 50. Completed should still block duplicates.
+    # Deleted/cancelled IDs vary by account, so we rely mainly on status text/flags.
+    if status_id in {"-1", "0"} and status_text:
+        return True
+
+    return False
+
+
 def body_contains_exact_external_id(body: Any, order_id: str) -> bool:
     order_id = clean(order_id)
 
     if isinstance(body, dict):
+        if is_deleted_or_cancelled_task(body):
+            return False
+
         external_fields = [
             "externalId",
             "externalID",
@@ -1203,8 +1254,9 @@ def body_contains_exact_external_id(body: Any, order_id: str) -> bool:
 def wodely_task_exists(order_id: str) -> tuple[bool, str]:
     order_id = clean(order_id)
 
-    if order_id.lower() in load_sent_order_ids():
-        return True, "local sent-orders register"
+    # Do not block from the local register.
+    # Reason: if a task was pushed, then deleted in Wodely, the local register is stale.
+    # The duplicate decision must come from Wodely active/completed task search only.
 
     api_key = get_setting("WODELY_API_KEY")
     if not api_key:
@@ -1441,10 +1493,16 @@ with st.expander("Diagnostics", expanded=False):
     st.write("App version:", APP_VERSION)
     st.write("Preview columns:", list(st.session_state.preview_df.columns))
     st.write("Sent-orders register:", str(get_sent_orders_file()))
-    st.write("Sent orders recorded:", len(load_sent_order_ids()))
+    st.write("Sent orders recorded for audit only:", len(load_sent_order_ids()))
     if not st.session_state.preview_df.empty:
         st.write("Blank OrderID rows:", int(st.session_state.preview_df["OrderID"].astype(str).str.strip().eq("").sum()))
         st.write("Orders in preview:", sorted([x for x in st.session_state.preview_df["OrderID"].astype(str).str.strip().unique().tolist() if x]))
+    if st.button("Clear sent-orders audit register", use_container_width=True):
+        sent_file = get_sent_orders_file()
+        if sent_file.exists():
+            sent_file.unlink()
+        st.success("Sent-orders audit register cleared.")
+        st.rerun()
 
 if st.session_state.push_result is not None:
     st.markdown("### Result")
