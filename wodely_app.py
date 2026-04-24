@@ -18,7 +18,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v37-wodely-date-range-sync"
+APP_VERSION = "2026-04-24-v38-locked-workflow-after-push"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -1570,6 +1570,10 @@ if "wodely_existing_order_ids" not in st.session_state:
     st.session_state.wodely_existing_order_ids = set()
 if "wodely_task_list_result" not in st.session_state:
     st.session_state.wodely_task_list_result = None
+if "wodely_check_done" not in st.session_state:
+    st.session_state.wodely_check_done = False
+if "push_completed" not in st.session_state:
+    st.session_state.push_completed = False
 
 left, right = st.columns([1, 1])
 
@@ -1610,6 +1614,12 @@ with button_right:
             st.error(str(exc))
 
 st.markdown("### Preview")
+if st.session_state.push_completed:
+    st.warning("Export completed. Workflow is locked. Press Reset before another export.")
+elif not st.session_state.wodely_check_done:
+    st.info("Run Check Existing Wodely Tasks before Push to Wodely is enabled.")
+else:
+    st.success("Existing Wodely tasks checked. Push to Wodely is enabled.")
 preview_df = prepare_preview_df(st.session_state.preview_df.copy())
 
 summary_cols = st.columns(4)
@@ -1623,6 +1633,7 @@ edited = st.data_editor(
     use_container_width=True,
     height=520,
     num_rows="dynamic",
+    disabled=st.session_state.push_completed,
     key="preview_editor",
     column_config={
         "COD (money)": st.column_config.NumberColumn(format="%.2f"),
@@ -1634,17 +1645,21 @@ st.session_state.preview_df = prepare_preview_df(edited)
 
 actions = st.columns([1, 1, 1, 1, 1])
 with actions[0]:
-    if st.button("Clear preview", use_container_width=True):
+    if st.button("Reset", use_container_width=True):
         st.session_state.preview_df = empty_preview_df()
         st.session_state.push_result = None
+        st.session_state.wodely_existing_order_ids = set()
+        st.session_state.wodely_task_list_result = None
+        st.session_state.wodely_check_done = False
+        st.session_state.push_completed = False
         st.rerun()
 
 with actions[1]:
     csv_bytes = prepare_preview_df(st.session_state.preview_df.copy()).to_csv(index=False).encode("utf-8-sig")
-    st.download_button("Download CSV", data=csv_bytes, file_name="delivery_preview.csv", mime="text/csv", use_container_width=True)
+    st.download_button("Download CSV", data=csv_bytes, file_name="delivery_preview.csv", mime="text/csv", use_container_width=True, disabled=st.session_state.push_completed)
 
 with actions[2]:
-    if st.button("Show Wodely payload", use_container_width=True, disabled=preview_df.empty):
+    if st.button("Show Wodely payload", use_container_width=True, disabled=preview_df.empty or st.session_state.push_completed):
         try:
             payloads = build_wodely_payloads(st.session_state.preview_df.copy())
             st.session_state.push_result = {"preview_only": True, "payload_count": len(payloads), "payload_preview": payloads[:3]}
@@ -1652,7 +1667,7 @@ with actions[2]:
             st.session_state.push_result = {"error": str(exc)}
 
 with actions[3]:
-    if st.button("Check Existing Wodely Tasks", use_container_width=True, disabled=preview_df.empty):
+    if st.button("Check Existing Wodely Tasks", use_container_width=True, disabled=preview_df.empty or st.session_state.push_completed):
         process_box = st.container(border=True)
         process_box.markdown("### Wodely Task Listing")
         try:
@@ -1660,28 +1675,31 @@ with actions[3]:
             result = list_existing_wodely_tasks(preview_order_ids, progress_area=process_box)
             st.session_state.wodely_task_list_result = result
             st.session_state.wodely_existing_order_ids = set(result.get("matched_order_ids", []))
+            st.session_state.wodely_check_done = True
             process_box.success(
                 f"Found {result.get('matched_order_id_count', 0)} matching existing non-cancelled order id(s) from the current preview."
             )
         except Exception as exc:
             st.session_state.wodely_task_list_result = {"error": str(exc)}
             st.session_state.wodely_existing_order_ids = set()
+            st.session_state.wodely_check_done = False
             process_box.error(str(exc))
             st.error(str(exc))
 
 with actions[4]:
-    list_ready = bool(st.session_state.wodely_existing_order_ids) or st.session_state.wodely_task_list_result is not None
-    if st.button("Push to Wodely", use_container_width=True, type="primary", disabled=preview_df.empty):
+    push_disabled = preview_df.empty or not st.session_state.wodely_check_done or st.session_state.push_completed
+    if st.button("Push to Wodely", use_container_width=True, type="primary", disabled=push_disabled):
         process_box = st.container(border=True)
         process_box.markdown("### Push Process")
         try:
             st.session_state.push_result = push_preview_to_wodely(
                 st.session_state.preview_df.copy(),
-                existing_order_ids=set(st.session_state.wodely_existing_order_ids) if st.session_state.wodely_task_list_result is not None else None,
+                existing_order_ids=set(st.session_state.wodely_existing_order_ids),
                 progress_area=process_box,
             )
-            process_box.success("Process complete.")
-            st.success("Pushed to Wodely.")
+            st.session_state.push_completed = True
+            process_box.success("Process complete. Workflow locked. Press Reset before another export.")
+            st.success("Pushed to Wodely. Press Reset before another export.")
         except Exception as exc:
             st.session_state.push_result = {"error": str(exc)}
             process_box.error(str(exc))
@@ -1732,6 +1750,8 @@ with st.expander("Diagnostics", expanded=False):
     st.write("Sent-orders register:", str(get_sent_orders_file()))
     st.write("Sent orders recorded for audit only:", len(load_sent_order_ids()))
     st.write("Loaded Wodely existing order IDs:", len(st.session_state.wodely_existing_order_ids))
+    st.write("Wodely check done:", st.session_state.wodely_check_done)
+    st.write("Push completed:", st.session_state.push_completed)
     if not st.session_state.preview_df.empty:
         st.write("Blank OrderID rows:", int(st.session_state.preview_df["OrderID"].astype(str).str.strip().eq("").sum()))
         st.write("Orders in preview:", sorted([x for x in st.session_state.preview_df["OrderID"].astype(str).str.strip().unique().tolist() if x]))
