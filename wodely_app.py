@@ -17,7 +17,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v18-wodely-search-duplicate-check"
+APP_VERSION = "2026-04-24-v19-preview-dedupe"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -280,9 +280,34 @@ def prepare_preview_df(df: pd.DataFrame) -> pd.DataFrame:
 
 def append_preview(existing_df: pd.DataFrame | None, new_df: pd.DataFrame) -> pd.DataFrame:
     new_df = prepare_preview_df(new_df)
+
     if existing_df is None or existing_df.empty:
-        return new_df.reset_index(drop=True)
-    combined = pd.concat([existing_df, new_df], ignore_index=True)
+        combined = new_df.reset_index(drop=True)
+    else:
+        combined = pd.concat([existing_df, new_df], ignore_index=True)
+
+    combined = prepare_preview_df(combined)
+
+    # Prevent duplicate preview rows when the same source is added more than once.
+    # Keep the first version so any manual edits already made in the preview are preserved.
+    dedupe_cols = ["Source", "OrderID", "SKU", "Description", "Qty"]
+    for col in dedupe_cols:
+        if col not in combined.columns:
+            combined[col] = ""
+
+    combined["_dedupe_key"] = (
+        combined["Source"].fillna("").astype(str).str.strip().str.lower()
+        + "|"
+        + combined["OrderID"].fillna("").astype(str).str.strip().str.lower()
+        + "|"
+        + combined["SKU"].fillna("").astype(str).str.strip().str.lower()
+        + "|"
+        + combined["Description"].fillna("").astype(str).str.strip().str.lower()
+        + "|"
+        + combined["Qty"].fillna("").astype(str).str.strip()
+    )
+
+    combined = combined.drop_duplicates(subset=["_dedupe_key"], keep="first").drop(columns=["_dedupe_key"])
     return prepare_preview_df(combined)
 
 
