@@ -16,7 +16,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v5-address-fix"
+APP_VERSION = "2026-04-24-v6-address-hard-stop-australia"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -347,37 +347,27 @@ def bc_extract_header(block: str) -> dict[str, str]:
     if len(tokens) > 1:
         customer_name = tokens[1]
 
-    lines = block.splitlines()
+    # Header/address extraction must stop before "Australia".
+    # The first part of the block is normally:
+    # customer_code<TAB>customer_name<TAB>address line 1\naddress line 2\nAustralia<TAB>Telephone...
+    pre_aus = re.split(r"\bAustralia\b", block, maxsplit=1, flags=re.I)[0]
+    header_lines = [line for line in pre_aus.splitlines() if clean(line)]
+
     address_lines: list[str] = []
+    if header_lines:
+        first_parts = [clean(x) for x in header_lines[0].split("\t") if clean(x)]
+        if len(first_parts) >= 3:
+            customer_account = first_parts[0]
+            customer_name = first_parts[1]
+            address_lines.append(first_parts[2])
+        elif len(first_parts) >= 2:
+            customer_account = first_parts[0]
+            customer_name = first_parts[1]
 
-    for line in lines:
-        parts = [clean(x) for x in line.split("\t") if clean(x)]
-        if not parts:
-            continue
-
-        # Customer block first line usually starts:
-        # CustomerCode | CustomerName | Address line 1
-        if len(parts) >= 3 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9\-/]{1,40}", parts[0]):
-            customer_account = parts[0]
-            customer_name = parts[1]
-            address_lines.append(parts[2])
-            continue
-
-        # Following address line before Australia, for example:
-        # ASHFORD, SA 5035
-        if address_lines and parts[0].lower() not in {
-            "australia",
-            "telephone",
-            "mobile phone",
-            "packinglist - order",
-            "packing list - order",
-            "location",
-        }:
-            address_lines.append(parts[0])
-            continue
-
-        if address_lines and parts[0].lower() == "australia":
-            break
+        for extra_line in header_lines[1:]:
+            extra = clean(extra_line)
+            if extra and not re.search(r"Packing\s*list\s*-\s*Order|Packinglist\s*-\s*Order|Location\s+Pallet", extra, re.I):
+                address_lines.append(extra)
 
     address = ", ".join(address_lines)
 
