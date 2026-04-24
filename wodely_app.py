@@ -18,7 +18,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v22-ignore-deleted-wodely-tasks"
+APP_VERSION = "2026-04-24-v23-ignore-cancelled-in-duplicate-check"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -1179,20 +1179,28 @@ def is_deleted_or_cancelled_task(task: Any) -> bool:
         if str(value).strip().lower() in {"true", "1", "yes", "y"}:
             return True
 
-    status_text = " ".join(
-        clean(task.get(field))
-        for field in [
-            "status",
-            "taskStatus",
-            "taskStatusName",
-            "statusName",
-            "task_status",
-            "task_status_name",
-        ]
-        if clean(task.get(field))
-    ).lower()
+    status_values = []
+    for field in [
+        "status",
+        "taskStatus",
+        "taskStatusName",
+        "statusName",
+        "task_status",
+        "task_status_name",
+        "taskStatusText",
+        "task_status_text",
+        "state",
+        "taskState",
+        "task_state",
+    ]:
+        if clean(task.get(field)):
+            status_values.append(clean(task.get(field)))
 
-    if any(word in status_text for word in ["deleted", "cancelled", "canceled"]):
+    status_text = " ".join(status_values).strip().lower()
+
+    # Deleted orders in Wodely appear under Cancelled.
+    # Cancelled tasks must NOT count as duplicates.
+    if any(word in status_text for word in ["deleted", "cancelled", "canceled", "cancel"]):
         return True
 
     status_id = clean(
@@ -1200,11 +1208,11 @@ def is_deleted_or_cancelled_task(task: Any) -> bool:
         or task.get("statusId")
         or task.get("task_status_id")
         or task.get("status_id")
-    )
+    ).lower()
 
-    # Wodely docs identify completed as 50. Completed should still block duplicates.
-    # Deleted/cancelled IDs vary by account, so we rely mainly on status text/flags.
-    if status_id in {"-1", "0"} and status_text:
+    # Completed is 50 and should still block duplicates.
+    # Cancelled/deleted IDs vary, so only rely on status ID when the text also indicates cancellation/deletion.
+    if status_id in {"cancelled", "canceled", "deleted"}:
         return True
 
     return False
@@ -1345,7 +1353,7 @@ def push_preview_to_wodely(df: pd.DataFrame) -> dict[str, Any]:
                 "index": idx,
                 "orderId": order_id,
                 "status_code": "SKIPPED",
-                "response": f"Already exists: {exists_reason}",
+                "response": f"Already exists in active/completed Wodely tasks: {exists_reason}",
             })
             continue
 
