@@ -8,6 +8,7 @@ from datetime import date, datetime, time
 from html import escape
 from io import BytesIO
 from typing import Any
+from urllib.parse import quote
 import xml.etree.ElementTree as ET
 
 import pandas as pd
@@ -16,7 +17,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v17-strict-wodely-duplicate-check"
+APP_VERSION = "2026-04-24-v18-wodely-search-duplicate-check"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -1007,33 +1008,74 @@ def get_wodely_task_create_url() -> str:
     return "https://api.wodely.com/v2/tasks"
 
 
-def get_wodely_task_lookup_url(order_id: str) -> str:
+def get_wodely_task_lookup_urls(order_id: str) -> list[str]:
+    order_id = clean(order_id)
     explicit = get_setting("WODELY_TASK_LOOKUP_URL")
     if explicit:
-        return explicit.rstrip("/").replace("{order_id}", order_id)
-    return f"{get_wodely_task_create_url()}/{order_id}"
+        return [explicit.rstrip("/").replace("{order_id}", quote(order_id, safe=""))]
+
+    base_url = get_wodely_task_create_url().rstrip("/")
+    encoded_order_id = quote(order_id, safe="")
+
+    # Try search/list endpoints first. Direct /tasks/{order_id} is not reliable
+    # unless Wodely uses externalKey as the actual task id.
+    return [
+        f"{base_url}?externalKey={encoded_order_id}",
+        f"{base_url}?orderId={encoded_order_id}",
+        f"{base_url}?external_key={encoded_order_id}",
+        f"{base_url}?search={encoded_order_id}",
+        f"{base_url}/{encoded_order_id}",
+    ]
+
+
+def extract_task_candidates(body: Any) -> list[Any]:
+    if isinstance(body, list):
+        return body
+
+    if isinstance(body, dict):
+        for key in ["data", "items", "results", "tasks"]:
+            value = body.get(key)
+            if isinstance(value, list):
+                return value
+
+        for key in ["item", "task", "result"]:
+            value = body.get(key)
+            if isinstance(value, dict):
+                return [value]
+
+        return [body]
+
+    return []
 
 
 def body_contains_exact_external_key(body: Any, order_id: str) -> bool:
-    order_id = clean(order_id)
+    order_id = clean(order_id).lower()
 
     if isinstance(body, dict):
-        external_key = clean(
-            body.get("externalKey")
-            or body.get("external_key")
-            or body.get("orderId")
-            or body.get("order_id")
-        )
-        if external_key == order_id:
-            return True
+        candidate_values = [
+            body.get("externalKey"),
+            body.get("external_key"),
+            body.get("externalId"),
+            body.get("external_id"),
+            body.get("orderId"),
+            body.get("order_id"),
+            body.get("reference"),
+            body.get("taskDesc"),
+        ]
 
-        for key in ["data", "item", "task", "result"]:
-            if key in body and body_contains_exact_external_key(body[key], order_id):
+        for value in candidate_values:
+            value_text = clean(value).lower()
+            if value_text == order_id:
                 return True
 
-        for key in ["items", "results", "tasks"]:
-            if key in body and isinstance(body[key], list):
-                return any(body_contains_exact_external_key(item, order_id) for item in body[key])
+            # taskDesc may contain something like:
+            # BoConcept Adelaide - os-007419 - Customer Name
+            if value_text and order_id in value_text:
+                return True
+
+        for value in body.values():
+            if isinstance(value, (dict, list)) and body_contains_exact_external_key(value, order_id):
+                return True
 
     if isinstance(body, list):
         return any(body_contains_exact_external_key(item, order_id) for item in body)
@@ -1047,32 +1089,48 @@ def wodely_task_exists(order_id: str) -> bool:
         raise RuntimeError("Missing WODELY_API_KEY")
 
     order_id = clean(order_id)
-    url = get_wodely_task_lookup_url(order_id)
 
     headers = {
         "Accept": "application/json",
         "Authorization": f"Basic {api_key}",
     }
 
-    response = requests.get(url, headers=headers, timeout=30)
+    lookup_errors: list[dict[str, Any]] = []
 
-    if response.status_code == 404:
-        return False
+    for url in get_wodely_task_lookup_urls(order_id):
+        response = requests.get(url, headers=headers, timeout=30)
 
-    try:
-        body = response.json()
-    except Exception:
-        body = {"raw": response.text}
+        if response.status_code == 404:
+            continue
 
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"Wodely lookup failed for {order_id}. "
-            f"Endpoint: {url}. Status: {response.status_code}. Response: {body}"
-        )
+        try:
+            body = response.json()
+        except Exception:
+            body = {"raw": response.text}
 
-    # Critical: do NOT treat any HTTP 200 as "exists".
-    # Only skip when the lookup response explicitly contains this exact externalKey/orderId.
-    return body_contains_exact_external_key(body, order_id)
+        if response.status_code >= 400:
+            lookup_errors.append({
+                "url": url,
+                "status_code": response.status_code,
+                "response": body,
+            })
+            continue
+
+        if body_contains_exact_external_key(body, order_id):
+            return True
+
+        candidates = extract_task_candidates(body)
+
+        # If the endpoint is clearly a filtered search endpoint and returns records,
+        # treat that as an existing task even if Wodely's field names differ.
+        if "?" in url and len(candidates) > 0:
+            body_text = json.dumps(body, default=str).lower()
+            if order_id.lower() in body_text:
+                return True
+
+    # Do not block job creation just because lookup failed on one candidate URL.
+    # Only stop on a confirmed duplicate.
+    return False
 
 
 def push_preview_to_wodely(df: pd.DataFrame) -> dict[str, Any]:
