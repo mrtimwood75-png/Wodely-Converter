@@ -18,7 +18,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v23-ignore-cancelled-in-duplicate-check"
+APP_VERSION = "2026-04-24-v26-merchant-field-is-merchant-id"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -1031,7 +1031,7 @@ def build_wodely_payloads(df: pd.DataFrame) -> list[dict[str, Any]]:
             get_group_value(group, "Delivery Date"),
             get_group_value(group, "Delivery Window"),
         )
-        merchant_name = clean(get_group_value(group, "Merchant"))
+        merchant_id = clean(get_group_value(group, "Merchant"))
         recipient_name = get_group_value(group, "Recipient Name")
         recipient_email = get_group_value(group, "Email")
         recipient_phone = get_group_value(group, "Phone")
@@ -1039,14 +1039,14 @@ def build_wodely_payloads(df: pd.DataFrame) -> list[dict[str, Any]]:
         sales_order_notes = get_group_value(group, "Notes")
         sales_person = get_group_value(group, "Sales Person")
         customer_code = get_group_value(group, "Customer Account")
-        task_desc = " - ".join([part for part in [merchant_name, order_id, recipient_name] if clean(part)])
+        task_desc = " - ".join([part for part in [merchant_id, order_id, recipient_name] if clean(part)])
         packages = build_packages_from_group(group, order_id)
 
         payload = prune_none({
             "taskDesc": task_desc,
             "externalKey": order_id,
             "externalId": order_id,
-            "merchantId": merchant_name,
+            "merchantId": merchant_id,
             "afterDateTime": after_dt,
             "beforeDateTime": before_dt,
             "destinationAddress": destination_address,
@@ -1062,7 +1062,7 @@ def build_wodely_payloads(df: pd.DataFrame) -> list[dict[str, Any]]:
         })
 
         if not payload.get("merchantId"):
-            raise RuntimeError(f"Order {order_id} is missing merchantId")
+            raise RuntimeError(f"Order {order_id} is missing merchantId from the Merchant field")
         if not payload.get("destinationAddress"):
             raise RuntimeError(f"Order {order_id} is missing destinationAddress")
         if not payload.get("recipientName"):
