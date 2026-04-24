@@ -18,7 +18,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v31-strict-list-tasks-package-orderid-dedupe"
+APP_VERSION = "2026-04-24-v32-wodely-search-endpoint-dedupe"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -1096,11 +1096,12 @@ def get_wodely_task_create_url() -> str:
 
 
 def get_wodely_task_list_url() -> str:
-    explicit = get_setting("WODELY_TASK_LIST_URL")
+    explicit = get_setting("WODELY_TASK_SEARCH_URL") or get_setting("WODELY_TASK_LIST_URL")
     if explicit:
         return explicit.rstrip("/")
 
-    return f"{get_wodely_task_create_url().rstrip('/')}/list"
+    # Wodely support/docs indicate existing task lookup should use the search endpoint.
+    return "https://api.wodely.com/v2/tasks/search"
 
 
 def get_wodely_headers() -> dict[str, str]:
@@ -1416,7 +1417,7 @@ def push_preview_to_wodely(df: pd.DataFrame, progress_area=None) -> dict[str, An
     return {
         "ok": True,
         "endpoint": url,
-        "list_endpoint": get_wodely_task_list_url(),
+        "search_endpoint": get_wodely_task_list_url(),
         "payload_count": len(payloads),
         "created_count": len(successes),
         "skipped_count": len(skipped),
@@ -1538,7 +1539,7 @@ with st.expander("Diagnostics", expanded=False):
     st.write("Merchant mapping:", {"BoConcept Adelaide": "954bc139-aade-4a41-8e8f-23b5c50b1cc2", "Transforma": "8644fbc2-0420-4b54-8521-64c02a341949"})
     st.write("Preview columns:", list(st.session_state.preview_df.columns))
     st.write("Wodely task create endpoint:", get_wodely_task_create_url())
-    st.write("Wodely task list endpoint:", get_wodely_task_list_url())
+    st.write("Wodely task search endpoint:", get_wodely_task_list_url())
     st.write("Sent-orders register:", str(get_sent_orders_file()))
     st.write("Sent orders recorded for audit only:", len(load_sent_order_ids()))
     if not st.session_state.preview_df.empty:
