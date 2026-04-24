@@ -16,7 +16,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v14-transforma-balance-owing"
+APP_VERSION = "2026-04-24-v16-payments-from-drtran-drhist"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -112,54 +112,27 @@ def first_money_field(record: dict[str, Any], field_names: list[str]) -> tuple[s
     return "", None
 
 
-def calculate_cod_amount(header: dict[str, Any]) -> float:
-    total_amount = to_float(header.get("TOTAMOUNT"))
+def calculate_order_total_from_lines(lines: list[dict[str, Any]]) -> float:
+    total = 0.0
 
-    # Prefer an explicit balance/outstanding field if the Options table exposes one.
-    # Some installations store payments separately from the order total.
-    balance_field, balance_value = first_money_field(
-        header,
-        [
-            "BALANCE",
-            "BALANCEOWING",
-            "BALANCE_OWING",
-            "OUTSTAND",
-            "OUTSTANDING",
-            "OUTSTANDINGAMOUNT",
-            "AMOUNTOUTSTANDING",
-            "CURBAL",
-            "CURRENTBALANCE",
-        ],
-    )
-    if balance_value is not None:
-        return max(balance_value, 0.0)
+    for line in lines:
+        qty = to_float(line.get("QTYORD"))
+        price_ex_gst = to_float(line.get("PRICE"))
+        gst_each = to_float(line.get("GSTDOLL"))
+        total += qty * (price_ex_gst + gst_each)
 
-    # Otherwise calculate balance owing from order total less all payment/credit fields found.
-    payment_fields = [
-        "PAID",
-        "TEMPPAID",
-        "TOTALPAYMENTS",
-        "TOTPAYMENTS",
-        "PAYMENTS",
-        "PAYMENT",
-        "TOTPAID",
-        "AMTPAID",
-        "AMOUNTPAID",
-        "PAIDAMT",
-        "PAIDAMOUNT",
-        "DEPOSIT",
-        "DEPOSITS",
-        "TOTCREDIT",
-        "CREDIT",
-        "CREDITS",
-    ]
+    return round(total, 2)
 
-    payments_total = 0.0
-    for field_name in payment_fields:
-        if field_name in header and clean(header.get(field_name)) != "":
-            payments_total += to_float(header.get(field_name))
 
-    return max(total_amount - payments_total, 0.0)
+def calculate_cod_amount(header: dict[str, Any], lines: list[dict[str, Any]], payments_total: float = 0.0) -> float:
+    # Options API documentation says sales order line total inc GST is:
+    # QTYORD * (PRICE + GSTDOLL)
+    # Payments are stored in DRTRAN / DRHIST as TYPE = "PA" with SALESORDER = order number.
+    line_total = calculate_order_total_from_lines(lines)
+    header_total = to_float(header.get("TOTAMOUNT"))
+
+    order_total = line_total if line_total > 0 else header_total
+    return max(round(order_total - payments_total, 2), 0.0)
 
 
 def join_non_blank(parts: list[Any], sep: str = ", ") -> str:
@@ -708,7 +681,7 @@ def fetch_lines_from_date(from_date: str) -> list[dict[str, str]]:
     xml_body = build_request_xml(
         client_key=client_key,
         table_name="DRSOLN",
-        fields=["ORDNO", "ACCDE", "STOCKCODE", "DESC", "MEMODESC", "OVERDESC", "QTYORD", "BOOKOUT", "DELIVTIME"],
+        fields=["ORDNO", "ACCDE", "STOCKCODE", "DESC", "MEMODESC", "OVERDESC", "QTYORD", "PRICE", "GSTDOLL", "BOOKOUT", "DELIVTIME"],
         conditions=[("BOOKOUT", "greaterOrEqualTo", options_to_date(from_date))],
         sort_by="ORDNO",
         max_records=5000,
@@ -718,85 +691,72 @@ def fetch_lines_from_date(from_date: str) -> list[dict[str, str]]:
 
 def fetch_header(order_no: str) -> dict[str, str]:
     client_key = get_setting("OPTIONS_CLIENT_KEY")
-    base_fields = [
-        "ORDNO",
-        "ACCDE",
-        "AREA",
-        "CUSTNAME",
-        "DELNAME",
-        "CONTACT",
-        "DEL1",
-        "DEL2",
-        "DEL3",
-        "DEL4",
-        "TOTAMOUNT",
-        "PAID",
-        "TEMPPAID",
-        "IMESS",
-        "NOTES",
-        "SETUPNOTE",
-        "MAINTNOTE",
-        "DELNOTE",
-    ]
-
     xml_body = build_request_xml(
         client_key=client_key,
         table_name="DRSOTR",
-        fields=base_fields,
+        fields=[
+            "ORDNO",
+            "ACCDE",
+            "AREA",
+            "CUSTNAME",
+            "DELNAME",
+            "CONTACT",
+            "DEL1",
+            "DEL2",
+            "DEL3",
+            "DEL4",
+            "TOTAMOUNT",
+            "PAID",
+            "TEMPPAID",
+            "IMESS",
+            "NOTES",
+            "SETUPNOTE",
+            "MAINTNOTE",
+            "DELNOTE",
+        ],
         conditions=[("ORDNO", "equals", clean(order_no))],
         sort_by="ORDNO",
         max_records=1,
     )
     records = parse_table_records(post_options_xml(xml_body), "DRSOTR")
-    header = records[0] if records else {}
+    return records[0] if records else {}
 
-    # Try optional payment/balance fields one at a time.
-    # Invalid fields are ignored so the app does not break if an Options field is absent.
-    optional_money_fields = [
-        "BALANCE",
-        "BALANCEOWING",
-        "BALANCE_OWING",
-        "OUTSTAND",
-        "OUTSTANDING",
-        "OUTSTANDINGAMOUNT",
-        "AMOUNTOUTSTANDING",
-        "CURBAL",
-        "CURRENTBALANCE",
-        "TOTALPAYMENTS",
-        "TOTPAYMENTS",
-        "PAYMENTS",
-        "PAYMENT",
-        "TOTPAID",
-        "AMTPAID",
-        "AMOUNTPAID",
-        "PAIDAMT",
-        "PAIDAMOUNT",
-        "DEPOSIT",
-        "DEPOSITS",
-        "TOTCREDIT",
-        "CREDIT",
-        "CREDITS",
-    ]
 
-    for field_name in optional_money_fields:
-        if field_name in header:
-            continue
-        try:
-            xml_body = build_request_xml(
-                client_key=client_key,
-                table_name="DRSOTR",
-                fields=["ORDNO", field_name],
-                conditions=[("ORDNO", "equals", clean(order_no))],
-                sort_by="ORDNO",
-                max_records=1,
-            )
-            extra_records = parse_table_records(post_options_xml(xml_body), "DRSOTR")
-            if extra_records and field_name in extra_records[0]:
-                header[field_name] = extra_records[0].get(field_name, "")
-        except Exception:
-            continue
+def fetch_payments_for_order(order_no: str) -> float:
+    client_key = get_setting("OPTIONS_CLIENT_KEY")
+    order_no = clean(order_no)
 
-    return header
+    fields_xml = (
+        "<field>SALESORDER</field>"
+        "<field>ACCDE</field>"
+        "<field>TRANDTE</field>"
+        "<field>TYPE</field>"
+        "<field>TOTAMOUNT</field>"
+    )
+
+    table_xml = ""
+    for table_name in ["DRTRAN", "DRHIST"]:
+        table_xml += (
+            f'<table name="{table_name}" sortBy="SALESORDER" maxRecords="0" firstRecord="1" requestType="">'
+            f"<fields>{fields_xml}</fields>"
+            "<conditions>"
+            f'<condition field="SALESORDER" type="equals">{escape(order_no)}</condition>'
+            '<condition field="TYPE" type="equals">PA</condition>'
+            "</conditions>"
+            "</table>"
+        )
+
+    xml_body = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        f'<request clientKey="{escape(client_key)}">'
+        f"{table_xml}"
+        "</request>"
+    )
+
+    root = post_options_xml(xml_body)
+    records = parse_table_records(root, "DRTRAN") + parse_table_records(root, "DRHIST")
+
+    return round(sum(to_float(record.get("TOTAMOUNT")) for record in records), 2)
 
 
 def fetch_contact(accde: str, contact_name: str = "") -> dict[str, str]:
@@ -852,10 +812,10 @@ def extract_phone_from_text(*values: Any) -> str:
     return ""
 
 
-def map_lines_to_preview_rows(order_no: str, lines: list[dict[str, str]], header: dict[str, str], contact: dict[str, str]) -> list[dict[str, Any]]:
+def map_lines_to_preview_rows(order_no: str, lines: list[dict[str, str]], header: dict[str, str], contact: dict[str, str], payments_total: float = 0.0) -> list[dict[str, Any]]:
     if not lines:
         return []
-    cod_amount = calculate_cod_amount(header)
+    cod_amount = calculate_cod_amount(header, lines, payments_total)
 
     customer_account = clean(header.get("ACCDE")) or clean(lines[0].get("ACCDE"))
     recipient_name = clean(header.get("DELNAME")) or clean(header.get("CUSTNAME"))
@@ -925,7 +885,17 @@ def fetch_transforma_options_preview(from_date: str | None = None) -> pd.DataFra
         contact_key = f"{accde}|{clean(header.get('CONTACT'))}"
         if contact_key not in contact_cache:
             contact_cache[contact_key] = fetch_contact(accde, header.get("CONTACT")) if accde else {}
-        preview_rows.extend(map_lines_to_preview_rows(order_no, order_lines, header, contact_cache.get(contact_key, {})))
+
+        payments_total = fetch_payments_for_order(order_no)
+        preview_rows.extend(
+            map_lines_to_preview_rows(
+                order_no,
+                order_lines,
+                header,
+                contact_cache.get(contact_key, {}),
+                payments_total,
+            )
+        )
     return prepare_preview_df(pd.DataFrame(preview_rows)) if preview_rows else empty_preview_df()
 
 
