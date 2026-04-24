@@ -18,7 +18,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v30-wodely-external-id-precheck"
+APP_VERSION = "2026-04-24-v31-strict-list-tasks-package-orderid-dedupe"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -1100,7 +1100,6 @@ def get_wodely_task_list_url() -> str:
     if explicit:
         return explicit.rstrip("/")
 
-    # Wodely List Tasks endpoint.
     return f"{get_wodely_task_create_url().rstrip('/')}/list"
 
 
@@ -1128,20 +1127,25 @@ def extract_task_records(body: Any) -> list[dict[str, Any]]:
         if isinstance(value, list):
             return [x for x in value if isinstance(x, dict)]
 
-    if any(k in body for k in ["id", "taskId", "externalKey", "externalId", "taskDesc"]):
+    if any(k in body for k in ["id", "taskId", "externalId", "externalKey", "packages", "taskDesc"]):
         return [body]
 
     return []
 
 
-def response_last_id(body: Any) -> str:
-    if not isinstance(body, dict):
-        return ""
+def response_last_id(body: Any, tasks: list[dict[str, Any]]) -> str:
+    if isinstance(body, dict):
+        for key in ["lastId", "lastID", "last_id", "nextLastId", "next_last_id"]:
+            value = clean(body.get(key))
+            if value:
+                return value
 
-    for key in ["lastId", "lastID", "last_id", "nextLastId", "next_last_id"]:
-        value = clean(body.get(key))
-        if value:
-            return value
+    if tasks:
+        last_task = tasks[-1]
+        for key in ["id", "taskId", "taskID", "_id"]:
+            value = clean(last_task.get(key))
+            if value:
+                return value
 
     return ""
 
@@ -1183,34 +1187,65 @@ def task_is_cancelled(task: dict[str, Any]) -> bool:
     return status_id in {"cancelled", "canceled"}
 
 
-def task_matches_external_id(task: dict[str, Any], order_id: str) -> bool:
+def task_matches_order_id(task: dict[str, Any], order_id: str) -> bool:
     order_id = clean(order_id).lower()
 
+    if not order_id:
+        return False
+
     for field in [
-        "externalKey",
-        "external_key",
         "externalId",
         "externalID",
         "external_id",
-        "orderId",
-        "orderID",
-        "order_id",
+        "externalKey",
+        "external_key",
     ]:
         if clean(task.get(field)).lower() == order_id:
             return True
 
-    # Some responses may nest task data.
+    packages = task.get("packages")
+    if isinstance(packages, list):
+        for package in packages:
+            if not isinstance(package, dict):
+                continue
+
+            for field in ["orderId", "orderID", "order_id"]:
+                if clean(package.get(field)).lower() == order_id:
+                    return True
+
     for value in task.values():
-        if isinstance(value, dict) and task_matches_external_id(value, order_id):
+        if isinstance(value, dict) and task_matches_order_id(value, order_id):
             return True
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict) and task_matches_order_id(item, order_id):
+                    return True
 
     return False
 
 
-def list_wodely_tasks_by_external_id(order_id: str, completed: bool = False, progress_area=None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def build_wodely_list_payload(order_id: str, *, completed: bool = False, last_id: str = "") -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "externalId": clean(order_id),
+        "limit": 100,
+    }
+
+    if completed:
+        payload.update({
+            "taskStatusId": "50",
+            "startDateTime": "2000-01-01T00:00:00Z",
+            "endDateTime": "2099-12-31T23:59:59Z",
+        })
+
+    if last_id:
+        payload["lastId"] = last_id
+
+    return payload
+
+
+def list_wodely_tasks_by_external_id(order_id: str, *, completed: bool = False, progress_area=None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     url = get_wodely_task_list_url()
     headers = get_wodely_headers()
-    order_id = clean(order_id)
 
     found: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
@@ -1219,24 +1254,11 @@ def list_wodely_tasks_by_external_id(order_id: str, completed: bool = False, pro
     seen_last_ids: set[str] = set()
 
     for page_no in range(1, 26):
-        payload: dict[str, Any] = {
-            "externalKey": order_id,
-            "limit": 100,
-        }
-
-        if completed:
-            payload.update({
-                "taskStatusId": "50",
-                "startDateTime": "2000-01-01T00:00:00Z",
-                "endDateTime": "2099-12-31T23:59:59Z",
-            })
-
-        if last_id:
-            payload["lastId"] = last_id
+        payload = build_wodely_list_payload(order_id, completed=completed, last_id=last_id)
 
         if progress_area is not None:
-            label = "completed" if completed else "active/current"
-            progress_area.write(f"Checking Wodely {label} tasks for external ID {order_id}, page {page_no}")
+            status_label = "completed" if completed else "active/current"
+            progress_area.write(f"Checking Wodely {status_label} tasks for External ID {order_id}, page {page_no}")
 
         try:
             response = requests.post(url, json=payload, headers=headers, timeout=45)
@@ -1260,16 +1282,21 @@ def list_wodely_tasks_by_external_id(order_id: str, completed: bool = False, pro
 
         tasks = extract_task_records(body)
 
+        if progress_area is not None:
+            progress_area.write(f"Wodely returned {len(tasks)} task record(s) on this page")
+
+        if not tasks:
+            break
+
         for task in tasks:
             if task_is_cancelled(task):
                 continue
 
-            # Support advised using List Tasks search by External ID.
-            # Confirm exact match locally before treating it as duplicate.
-            if task_matches_external_id(task, order_id):
+            if task_matches_order_id(task, order_id):
                 found.append(task)
 
-        next_last_id = response_last_id(body)
+        next_last_id = response_last_id(body, tasks)
+
         if not next_last_id or next_last_id in seen_last_ids:
             break
 
@@ -1280,13 +1307,23 @@ def list_wodely_tasks_by_external_id(order_id: str, completed: bool = False, pro
 
 
 def wodely_task_exists(order_id: str, progress_area=None) -> tuple[bool, str, list[dict[str, Any]]]:
-    active_tasks, active_errors = list_wodely_tasks_by_external_id(order_id, completed=False, progress_area=progress_area)
-    if active_tasks:
-        return True, f"found {len(active_tasks)} active/current task(s)", active_errors
+    active_tasks, active_errors = list_wodely_tasks_by_external_id(
+        order_id,
+        completed=False,
+        progress_area=progress_area,
+    )
 
-    completed_tasks, completed_errors = list_wodely_tasks_by_external_id(order_id, completed=True, progress_area=progress_area)
+    if active_tasks:
+        return True, f"found {len(active_tasks)} active/current non-cancelled task(s)", active_errors
+
+    completed_tasks, completed_errors = list_wodely_tasks_by_external_id(
+        order_id,
+        completed=True,
+        progress_area=progress_area,
+    )
+
     if completed_tasks:
-        return True, f"found {len(completed_tasks)} completed task(s)", active_errors + completed_errors
+        return True, f"found {len(completed_tasks)} completed non-cancelled task(s)", active_errors + completed_errors
 
     return False, "no non-cancelled task found for this External ID", active_errors + completed_errors
 
