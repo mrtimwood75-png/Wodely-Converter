@@ -16,7 +16,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v5-address-fix"
+APP_VERSION = "2026-04-24-v4-boconcept-parser-diagnostics"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -347,39 +347,15 @@ def bc_extract_header(block: str) -> dict[str, str]:
     if len(tokens) > 1:
         customer_name = tokens[1]
 
-    lines = block.splitlines()
-    address_lines: list[str] = []
-
-    for line in lines:
-        parts = [clean(x) for x in line.split("\t") if clean(x)]
-        if not parts:
-            continue
-
-        # Customer block first line usually starts:
-        # CustomerCode | CustomerName | Address line 1
-        if len(parts) >= 3 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9\-/]{1,40}", parts[0]):
-            customer_account = parts[0]
-            customer_name = parts[1]
-            address_lines.append(parts[2])
-            continue
-
-        # Following address line before Australia, for example:
-        # ASHFORD, SA 5035
-        if address_lines and parts[0].lower() not in {
-            "australia",
-            "telephone",
-            "mobile phone",
-            "packinglist - order",
-            "packing list - order",
-            "location",
-        }:
-            address_lines.append(parts[0])
-            continue
-
-        if address_lines and parts[0].lower() == "australia":
-            break
-
-    address = ", ".join(address_lines)
+    if "Australia" in tokens:
+        aus_idx = tokens.index("Australia")
+        addr_parts = []
+        start_idx = 2 if customer_account and customer_name else 0
+        for tok in tokens[start_idx:aus_idx]:
+            if tok.lower() in {"telephone", "mobile phone"}:
+                break
+            addr_parts.append(tok)
+        address = ", ".join([p for p in addr_parts if p])
 
     for i, tok in enumerate(tokens):
         low = tok.lower()
@@ -985,7 +961,6 @@ summary_cols[3].metric("Transforma rows", int((preview_df["Source"] == "Transfor
 edited = st.data_editor(
     preview_df,
     use_container_width=True,
-    height=520,
     num_rows="dynamic",
     key="preview_editor",
     column_config={
