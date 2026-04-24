@@ -18,7 +18,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v28-safe-settings-merchant-id-map"
+APP_VERSION = "2026-04-24-v30-wodely-external-id-precheck"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -1095,104 +1095,59 @@ def get_wodely_task_create_url() -> str:
     return "https://api.wodely.com/v2/tasks"
 
 
-def get_wodely_task_lookup_urls(order_id: str) -> list[str]:
+def get_wodely_task_list_url() -> str:
     explicit = get_setting("WODELY_TASK_LIST_URL")
     if explicit:
-        return [explicit.rstrip("/")]
+        return explicit.rstrip("/")
 
-    base_url = get_wodely_task_create_url().rstrip("/")
-
-    # Docs refer to "List tasks" using a JSON payload body. Tenants/API versions may expose it
-    # under either /list or /search, so try both once.
-    return [
-        f"{base_url}/list",
-        f"{base_url}/search",
-    ]
+    # Wodely List Tasks endpoint.
+    return f"{get_wodely_task_create_url().rstrip('/')}/list"
 
 
-def make_wodely_list_payloads(order_id: str) -> list[dict[str, Any]]:
-    order_id = clean(order_id)
-    start_dt = "2000-01-01T00:00:00Z"
-    end_dt = "2099-12-31T23:59:59Z"
+def get_wodely_headers() -> dict[str, str]:
+    api_key = get_setting("WODELY_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing WODELY_API_KEY. Add it to Streamlit Secrets or environment variables.")
 
-    base_payloads = [
-        {"searchText": order_id, "limit": 100},
-        {"externalId": order_id, "limit": 100},
-        {"externalKey": order_id, "limit": 100},
-        {"orderId": order_id, "limit": 100},
-        {"taskDesc": order_id, "limit": 100},
-    ]
-
-    payloads: list[dict[str, Any]] = []
-
-    for payload in base_payloads:
-        active_payload = payload.copy()
-        payloads.append(active_payload)
-
-        # Wodely docs: completed historical tasks require taskStatusId "50"
-        # and use startDateTime / endDateTime for completion timestamps.
-        completed_payload = payload.copy()
-        completed_payload.update({
-            "taskStatusId": "50",
-            "startDateTime": start_dt,
-            "endDateTime": end_dt,
-        })
-        payloads.append(completed_payload)
-
-    return payloads
+    return {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Basic {api_key}",
+    }
 
 
-def extract_task_candidates(body: Any) -> list[Any]:
+def extract_task_records(body: Any) -> list[dict[str, Any]]:
     if isinstance(body, list):
-        return body
+        return [x for x in body if isinstance(x, dict)]
 
-    if isinstance(body, dict):
-        for key in ["data", "items", "results", "tasks", "records", "rows"]:
-            value = body.get(key)
-            if isinstance(value, list):
-                return value
+    if not isinstance(body, dict):
+        return []
 
-        for key in ["item", "task", "result", "record"]:
-            value = body.get(key)
-            if isinstance(value, dict):
-                return [value]
+    for key in ["tasks", "data", "items", "results", "records", "rows"]:
+        value = body.get(key)
+        if isinstance(value, list):
+            return [x for x in value if isinstance(x, dict)]
 
+    if any(k in body for k in ["id", "taskId", "externalKey", "externalId", "taskDesc"]):
         return [body]
 
     return []
 
 
-def text_has_exact_order_id(value: Any, order_id: str) -> bool:
-    value_text = clean(value).lower()
-    order_id = clean(order_id).lower()
+def response_last_id(body: Any) -> str:
+    if not isinstance(body, dict):
+        return ""
 
-    if not value_text or not order_id:
-        return False
+    for key in ["lastId", "lastID", "last_id", "nextLastId", "next_last_id"]:
+        value = clean(body.get(key))
+        if value:
+            return value
 
-    if value_text == order_id:
-        return True
-
-    return bool(re.search(rf"(?<![A-Za-z0-9]){re.escape(order_id)}(?![A-Za-z0-9])", value_text))
+    return ""
 
 
-def is_deleted_or_cancelled_task(task: Any) -> bool:
-    if not isinstance(task, dict):
-        return False
-
-    deleted_flags = [
-        task.get("deleted"),
-        task.get("isDeleted"),
-        task.get("is_deleted"),
-        task.get("archived"),
-        task.get("isArchived"),
-        task.get("is_archived"),
-    ]
-
-    for value in deleted_flags:
-        if str(value).strip().lower() in {"true", "1", "yes", "y"}:
-            return True
-
-    status_values = []
+def task_status_text(task: dict[str, Any]) -> str:
+    parts = []
     for field in [
         "status",
         "taskStatus",
@@ -1206,14 +1161,16 @@ def is_deleted_or_cancelled_task(task: Any) -> bool:
         "taskState",
         "task_state",
     ]:
-        if clean(task.get(field)):
-            status_values.append(clean(task.get(field)))
+        value = clean(task.get(field))
+        if value:
+            parts.append(value)
 
-    status_text = " ".join(status_values).strip().lower()
+    return " ".join(parts).lower()
 
-    # Deleted orders in Wodely appear under Cancelled.
-    # Cancelled tasks must NOT count as duplicates.
-    if any(word in status_text for word in ["deleted", "cancelled", "canceled", "cancel"]):
+
+def task_is_cancelled(task: dict[str, Any]) -> bool:
+    status_text = task_status_text(task)
+    if "cancel" in status_text:
         return True
 
     status_id = clean(
@@ -1223,131 +1180,137 @@ def is_deleted_or_cancelled_task(task: Any) -> bool:
         or task.get("status_id")
     ).lower()
 
-    # Completed is 50 and should still block duplicates.
-    # Cancelled/deleted IDs vary, so only rely on status ID when the text also indicates cancellation/deletion.
-    if status_id in {"cancelled", "canceled", "deleted"}:
-        return True
+    return status_id in {"cancelled", "canceled"}
+
+
+def task_matches_external_id(task: dict[str, Any], order_id: str) -> bool:
+    order_id = clean(order_id).lower()
+
+    for field in [
+        "externalKey",
+        "external_key",
+        "externalId",
+        "externalID",
+        "external_id",
+        "orderId",
+        "orderID",
+        "order_id",
+    ]:
+        if clean(task.get(field)).lower() == order_id:
+            return True
+
+    # Some responses may nest task data.
+    for value in task.values():
+        if isinstance(value, dict) and task_matches_external_id(value, order_id):
+            return True
 
     return False
 
 
-def body_contains_exact_external_id(body: Any, order_id: str) -> bool:
+def list_wodely_tasks_by_external_id(order_id: str, completed: bool = False, progress_area=None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    url = get_wodely_task_list_url()
+    headers = get_wodely_headers()
     order_id = clean(order_id)
 
-    if isinstance(body, dict):
-        if is_deleted_or_cancelled_task(body):
-            return False
-
-        external_fields = [
-            "externalId",
-            "externalID",
-            "external_id",
-            "externalKey",
-            "external_key",
-            "orderId",
-            "orderID",
-            "order_id",
-            "salesOrder",
-            "sales_order",
-            "reference",
-            "ref",
-        ]
-
-        for field in external_fields:
-            if field in body and text_has_exact_order_id(body.get(field), order_id):
-                return True
-
-        # Fallback because Wodely may return task fields with different names.
-        for field in ["taskDesc", "description", "salesOrderNotes", "notes", "tag1", "tag2", "tag3", "tag4"]:
-            if field in body and text_has_exact_order_id(body.get(field), order_id):
-                return True
-
-        for value in body.values():
-            if isinstance(value, (dict, list)) and body_contains_exact_external_id(value, order_id):
-                return True
-
-    if isinstance(body, list):
-        return any(body_contains_exact_external_id(item, order_id) for item in body)
-
-    return False
-
-
-def wodely_task_exists(order_id: str) -> tuple[bool, str]:
-    order_id = clean(order_id)
-
-    # Do not block from the local register.
-    # Reason: if a task was pushed, then deleted in Wodely, the local register is stale.
-    # The duplicate decision must come from Wodely active/completed task search only.
-
-    api_key = get_setting("WODELY_API_KEY")
-    if not api_key:
-        raise RuntimeError("Missing WODELY_API_KEY. Add it to Streamlit Secrets or environment variables.")
-
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Authorization": f"Basic {api_key}",
-    }
-
+    found: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
 
-    for url in get_wodely_task_lookup_urls(order_id):
-        for payload in make_wodely_list_payloads(order_id):
-            try:
-                response = requests.post(url, json=payload, headers=headers, timeout=30)
-            except Exception as exc:
-                errors.append({"url": url, "payload": payload, "error": str(exc)})
+    last_id = ""
+    seen_last_ids: set[str] = set()
+
+    for page_no in range(1, 26):
+        payload: dict[str, Any] = {
+            "externalKey": order_id,
+            "limit": 100,
+        }
+
+        if completed:
+            payload.update({
+                "taskStatusId": "50",
+                "startDateTime": "2000-01-01T00:00:00Z",
+                "endDateTime": "2099-12-31T23:59:59Z",
+            })
+
+        if last_id:
+            payload["lastId"] = last_id
+
+        if progress_area is not None:
+            label = "completed" if completed else "active/current"
+            progress_area.write(f"Checking Wodely {label} tasks for external ID {order_id}, page {page_no}")
+
+        try:
+            response = requests.post(url, json=payload, headers=headers, timeout=45)
+        except Exception as exc:
+            errors.append({"url": url, "payload": payload, "error": str(exc)})
+            break
+
+        try:
+            body = response.json()
+        except Exception:
+            body = {"raw": response.text}
+
+        if response.status_code >= 400:
+            errors.append({
+                "url": url,
+                "payload": payload,
+                "status_code": response.status_code,
+                "response": body,
+            })
+            break
+
+        tasks = extract_task_records(body)
+
+        for task in tasks:
+            if task_is_cancelled(task):
                 continue
 
-            try:
-                body = response.json()
-            except Exception:
-                body = {"raw": response.text}
+            # Support advised using List Tasks search by External ID.
+            # Confirm exact match locally before treating it as duplicate.
+            if task_matches_external_id(task, order_id):
+                found.append(task)
 
-            if response.status_code == 404:
-                continue
+        next_last_id = response_last_id(body)
+        if not next_last_id or next_last_id in seen_last_ids:
+            break
 
-            if response.status_code >= 400:
-                errors.append({
-                    "url": url,
-                    "payload": payload,
-                    "status_code": response.status_code,
-                    "response": body,
-                })
-                continue
+        seen_last_ids.add(next_last_id)
+        last_id = next_last_id
 
-            if body_contains_exact_external_id(body, order_id):
-                return True, f"Wodely List Tasks endpoint: {url}"
-
-            body_text = json.dumps(body, default=str)
-            if text_has_exact_order_id(body_text, order_id):
-                return True, f"Wodely List Tasks endpoint text match: {url}"
-
-    # If Wodely lookup endpoint is not available/configured, do not block creation.
-    return False, "no existing task found"
+    return found, errors
 
 
-def push_preview_to_wodely(df: pd.DataFrame) -> dict[str, Any]:
+def wodely_task_exists(order_id: str, progress_area=None) -> tuple[bool, str, list[dict[str, Any]]]:
+    active_tasks, active_errors = list_wodely_tasks_by_external_id(order_id, completed=False, progress_area=progress_area)
+    if active_tasks:
+        return True, f"found {len(active_tasks)} active/current task(s)", active_errors
+
+    completed_tasks, completed_errors = list_wodely_tasks_by_external_id(order_id, completed=True, progress_area=progress_area)
+    if completed_tasks:
+        return True, f"found {len(completed_tasks)} completed task(s)", active_errors + completed_errors
+
+    return False, "no non-cancelled task found for this External ID", active_errors + completed_errors
+
+
+def push_preview_to_wodely(df: pd.DataFrame, progress_area=None) -> dict[str, Any]:
     url = get_wodely_task_create_url()
-    api_key = get_setting("WODELY_API_KEY")
-    if not api_key:
-        raise RuntimeError("Missing WODELY_API_KEY. Add it to Streamlit Secrets or environment variables.")
-
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Authorization": f"Basic {api_key}",
-    }
+    headers = get_wodely_headers()
 
     payloads = build_wodely_payloads(df)
     successes: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    lookup_errors: list[dict[str, Any]] = []
 
     seen_in_this_push: set[str] = set()
 
+    if progress_area is not None:
+        progress_area.write(f"Prepared {len(payloads)} task(s). Starting Wodely External ID checks.")
+
     for idx, payload in enumerate(payloads, start=1):
         order_id = clean(payload.get("externalKey"))
+
+        if progress_area is not None:
+            progress_area.write(f"Task {idx}/{len(payloads)}: {order_id}")
 
         if order_id.lower() in seen_in_this_push:
             skipped.append({
@@ -1356,19 +1319,28 @@ def push_preview_to_wodely(df: pd.DataFrame) -> dict[str, Any]:
                 "status_code": "SKIPPED",
                 "response": "Duplicate within this push batch",
             })
+            if progress_area is not None:
+                progress_area.write(f"Skipped {order_id}: duplicate within this push batch")
             continue
 
         seen_in_this_push.add(order_id.lower())
 
-        exists, exists_reason = wodely_task_exists(order_id)
+        exists, exists_reason, errors = wodely_task_exists(order_id, progress_area=progress_area)
+        lookup_errors.extend(errors)
+
         if exists:
             skipped.append({
                 "index": idx,
                 "orderId": order_id,
                 "status_code": "SKIPPED",
-                "response": f"Already exists in active/completed Wodely tasks: {exists_reason}",
+                "response": f"Already exists in Wodely: {exists_reason}",
             })
+            if progress_area is not None:
+                progress_area.write(f"Skipped {order_id}: {exists_reason}")
             continue
+
+        if progress_area is not None:
+            progress_area.write(f"Creating {order_id} in Wodely")
 
         response = requests.post(url, json=payload, headers=headers, timeout=120)
         try:
@@ -1385,6 +1357,8 @@ def push_preview_to_wodely(df: pd.DataFrame) -> dict[str, Any]:
 
         if response.status_code >= 400:
             failures.append(row)
+            if progress_area is not None:
+                progress_area.write(f"Failed {order_id}: HTTP {response.status_code}")
         else:
             successes.append(row)
             record_sent_order(
@@ -1393,6 +1367,8 @@ def push_preview_to_wodely(df: pd.DataFrame) -> dict[str, Any]:
                 recipient_name=clean(payload.get("recipientName")),
                 response_body=body,
             )
+            if progress_area is not None:
+                progress_area.write(f"Created {order_id}")
 
     if failures:
         raise RuntimeError(
@@ -1403,9 +1379,12 @@ def push_preview_to_wodely(df: pd.DataFrame) -> dict[str, Any]:
     return {
         "ok": True,
         "endpoint": url,
+        "list_endpoint": get_wodely_task_list_url(),
         "payload_count": len(payloads),
         "created_count": len(successes),
         "skipped_count": len(skipped),
+        "lookup_error_count": len(lookup_errors),
+        "lookup_errors": lookup_errors[:10],
         "successes": successes,
         "skipped": skipped,
         "payload_preview": payloads[:3],
@@ -1503,17 +1482,26 @@ with actions[2]:
             st.session_state.push_result = {"error": str(exc)}
 with actions[3]:
     if st.button("Push to Wodely", use_container_width=True, type="primary", disabled=preview_df.empty):
+        process_box = st.container(border=True)
+        process_box.markdown("### Process")
         try:
-            st.session_state.push_result = push_preview_to_wodely(st.session_state.preview_df.copy())
+            st.session_state.push_result = push_preview_to_wodely(
+                st.session_state.preview_df.copy(),
+                progress_area=process_box,
+            )
+            process_box.success("Process complete.")
             st.success("Pushed to Wodely.")
         except Exception as exc:
             st.session_state.push_result = {"error": str(exc)}
+            process_box.error(str(exc))
             st.error(str(exc))
 
 with st.expander("Diagnostics", expanded=False):
     st.write("App version:", APP_VERSION)
     st.write("Merchant mapping:", {"BoConcept Adelaide": "954bc139-aade-4a41-8e8f-23b5c50b1cc2", "Transforma": "8644fbc2-0420-4b54-8521-64c02a341949"})
     st.write("Preview columns:", list(st.session_state.preview_df.columns))
+    st.write("Wodely task create endpoint:", get_wodely_task_create_url())
+    st.write("Wodely task list endpoint:", get_wodely_task_list_url())
     st.write("Sent-orders register:", str(get_sent_orders_file()))
     st.write("Sent orders recorded for audit only:", len(load_sent_order_ids()))
     if not st.session_state.preview_df.empty:
