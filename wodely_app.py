@@ -17,7 +17,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v19-preview-dedupe"
+APP_VERSION = "2026-04-24-v20-wodely-external-id-dedupe"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -997,6 +997,7 @@ def build_wodely_payloads(df: pd.DataFrame) -> list[dict[str, Any]]:
         payload = prune_none({
             "taskDesc": task_desc,
             "externalKey": order_id,
+            "externalId": order_id,
             "merchantId": merchant_name,
             "afterDateTime": after_dt,
             "beforeDateTime": before_dt,
@@ -1042,13 +1043,23 @@ def get_wodely_task_lookup_urls(order_id: str) -> list[str]:
     base_url = get_wodely_task_create_url().rstrip("/")
     encoded_order_id = quote(order_id, safe="")
 
-    # Try search/list endpoints first. Direct /tasks/{order_id} is not reliable
-    # unless Wodely uses externalKey as the actual task id.
+    # Wodely search/list endpoints vary between tenants/API versions.
+    # The app checks all likely external-id search styles plus broad task lists.
     return [
+        f"{base_url}?externalId={encoded_order_id}",
         f"{base_url}?externalKey={encoded_order_id}",
-        f"{base_url}?orderId={encoded_order_id}",
+        f"{base_url}?external_id={encoded_order_id}",
         f"{base_url}?external_key={encoded_order_id}",
+        f"{base_url}?orderId={encoded_order_id}",
+        f"{base_url}?order_id={encoded_order_id}",
         f"{base_url}?search={encoded_order_id}",
+        f"{base_url}?keyword={encoded_order_id}",
+        f"{base_url}?q={encoded_order_id}",
+        f"{base_url}?status=active",
+        f"{base_url}?status=completed",
+        f"{base_url}?status=failed",
+        f"{base_url}?status=cancelled",
+        f"{base_url}",
         f"{base_url}/{encoded_order_id}",
     ]
 
@@ -1058,12 +1069,12 @@ def extract_task_candidates(body: Any) -> list[Any]:
         return body
 
     if isinstance(body, dict):
-        for key in ["data", "items", "results", "tasks"]:
+        for key in ["data", "items", "results", "tasks", "records", "rows"]:
             value = body.get(key)
             if isinstance(value, list):
                 return value
 
-        for key in ["item", "task", "result"]:
+        for key in ["item", "task", "result", "record"]:
             value = body.get(key)
             if isinstance(value, dict):
                 return [value]
@@ -1073,37 +1084,56 @@ def extract_task_candidates(body: Any) -> list[Any]:
     return []
 
 
-def body_contains_exact_external_key(body: Any, order_id: str) -> bool:
+def text_has_exact_order_id(value: Any, order_id: str) -> bool:
+    value_text = clean(value).lower()
     order_id = clean(order_id).lower()
 
+    if not value_text or not order_id:
+        return False
+
+    if value_text == order_id:
+        return True
+
+    # Match order id as a standalone token inside fields such as taskDesc or sales order notes.
+    return bool(re.search(rf"(?<![A-Za-z0-9]){re.escape(order_id)}(?![A-Za-z0-9])", value_text))
+
+
+def body_contains_exact_external_id(body: Any, order_id: str) -> bool:
+    order_id = clean(order_id)
+
     if isinstance(body, dict):
-        candidate_values = [
-            body.get("externalKey"),
-            body.get("external_key"),
-            body.get("externalId"),
-            body.get("external_id"),
-            body.get("orderId"),
-            body.get("order_id"),
-            body.get("reference"),
-            body.get("taskDesc"),
+        # Prefer true external-id fields.
+        external_fields = [
+            "externalId",
+            "externalID",
+            "external_id",
+            "externalKey",
+            "external_key",
+            "orderId",
+            "orderID",
+            "order_id",
+            "salesOrder",
+            "sales_order",
+            "reference",
+            "ref",
         ]
 
-        for value in candidate_values:
-            value_text = clean(value).lower()
-            if value_text == order_id:
+        for field in external_fields:
+            if field in body and text_has_exact_order_id(body.get(field), order_id):
                 return True
 
-            # taskDesc may contain something like:
-            # BoConcept Adelaide - os-007419 - Customer Name
-            if value_text and order_id in value_text:
+        # Fallback for Wodely responses that do not expose the external-id field clearly.
+        # The app itself places the order id in taskDesc, package orderId, and sometimes notes.
+        for field in ["taskDesc", "description", "salesOrderNotes", "notes", "tag1", "tag2", "tag3", "tag4"]:
+            if field in body and text_has_exact_order_id(body.get(field), order_id):
                 return True
 
         for value in body.values():
-            if isinstance(value, (dict, list)) and body_contains_exact_external_key(value, order_id):
+            if isinstance(value, (dict, list)) and body_contains_exact_external_id(value, order_id):
                 return True
 
     if isinstance(body, list):
-        return any(body_contains_exact_external_key(item, order_id) for item in body)
+        return any(body_contains_exact_external_id(item, order_id) for item in body)
 
     return False
 
@@ -1120,10 +1150,11 @@ def wodely_task_exists(order_id: str) -> bool:
         "Authorization": f"Basic {api_key}",
     }
 
-    lookup_errors: list[dict[str, Any]] = []
-
     for url in get_wodely_task_lookup_urls(order_id):
-        response = requests.get(url, headers=headers, timeout=30)
+        try:
+            response = requests.get(url, headers=headers, timeout=30)
+        except Exception:
+            continue
 
         if response.status_code == 404:
             continue
@@ -1134,27 +1165,19 @@ def wodely_task_exists(order_id: str) -> bool:
             body = {"raw": response.text}
 
         if response.status_code >= 400:
-            lookup_errors.append({
-                "url": url,
-                "status_code": response.status_code,
-                "response": body,
-            })
             continue
 
-        if body_contains_exact_external_key(body, order_id):
+        # Only skip when this exact sales order number/external id is found in returned task data.
+        if body_contains_exact_external_id(body, order_id):
             return True
 
-        candidates = extract_task_candidates(body)
-
-        # If the endpoint is clearly a filtered search endpoint and returns records,
-        # treat that as an existing task even if Wodely's field names differ.
-        if "?" in url and len(candidates) > 0:
-            body_text = json.dumps(body, default=str).lower()
-            if order_id.lower() in body_text:
+        # For filtered search endpoints, inspect the raw JSON string as a final guard.
+        # This catches Wodely field names that differ from the documented/expected names.
+        if "?" in url:
+            body_text = json.dumps(body, default=str)
+            if text_has_exact_order_id(body_text, order_id):
                 return True
 
-    # Do not block job creation just because lookup failed on one candidate URL.
-    # Only stop on a confirmed duplicate.
     return False
 
 
