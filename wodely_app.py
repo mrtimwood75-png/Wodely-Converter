@@ -16,7 +16,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v7-skip-existing-wodely"
+APP_VERSION = "2026-04-24-v8-ui-alignment-labels"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -993,7 +993,8 @@ left, right = st.columns([1, 1])
 
 with left:
     st.markdown("### BoConcept")
-    bc_file = st.file_uploader("Packing list TXT", type=["txt"], key="bc_txt")
+    bc_file = st.file_uploader("Packing List - Order TXT", type=["txt"], key="bc_txt")
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     if st.button("Add BoConcept to preview", use_container_width=True):
         try:
             if bc_file is None:
@@ -1011,6 +1012,7 @@ with right:
     st.markdown("### Transforma")
     default_date = date.today().strftime("%Y-%m-%d")
     from_date = st.date_input("Pull Options bookings from", value=date.today(), format="YYYY-MM-DD")
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     if st.button("Add Transforma API to preview", use_container_width=True):
         try:
             tf_df = fetch_transforma_options_preview(from_date.strftime("%Y-%m-%d") if from_date else default_date)
