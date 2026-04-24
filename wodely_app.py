@@ -16,7 +16,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v6-address-hard-stop-australia"
+APP_VERSION = "2026-04-24-v7-skip-existing-wodely"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -869,6 +869,49 @@ def get_wodely_task_create_url() -> str:
     return "https://api.wodely.com/v2/tasks"
 
 
+def get_wodely_task_lookup_url(order_id: str) -> str:
+    explicit = get_setting("WODELY_TASK_LOOKUP_URL")
+    if explicit:
+        return explicit.rstrip("/").replace("{order_id}", order_id)
+    return f"{get_wodely_task_create_url()}/{order_id}"
+
+
+def wodely_task_exists(order_id: str) -> bool:
+    api_key = get_setting("WODELY_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing WODELY_API_KEY")
+
+    url = get_wodely_task_lookup_url(clean(order_id))
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Basic {api_key}",
+    }
+
+    response = requests.get(url, headers=headers, timeout=30)
+
+    if response.status_code == 200:
+        return True
+
+    if response.status_code == 404:
+        return False
+
+    # Some APIs use a search-style endpoint and return an empty list/object.
+    try:
+        body = response.json()
+        if response.status_code < 400:
+            if body in ({}, [], None):
+                return False
+            if isinstance(body, dict):
+                for key in ["data", "items", "results", "tasks"]:
+                    if key in body and isinstance(body[key], list):
+                        return len(body[key]) > 0
+                return True
+    except Exception:
+        body = response.text
+
+    raise RuntimeError(f"Wodely lookup failed for {order_id}. Endpoint: {url}. Status: {response.status_code}. Response: {body}")
+
+
 def push_preview_to_wodely(df: pd.DataFrame) -> dict[str, Any]:
     url = get_wodely_task_create_url()
     api_key = get_setting("WODELY_API_KEY")
@@ -884,8 +927,20 @@ def push_preview_to_wodely(df: pd.DataFrame) -> dict[str, Any]:
     payloads = build_wodely_payloads(df)
     successes: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
 
     for idx, payload in enumerate(payloads, start=1):
+        order_id = clean(payload.get("externalKey"))
+
+        if wodely_task_exists(order_id):
+            skipped.append({
+                "index": idx,
+                "orderId": order_id,
+                "status_code": "SKIPPED",
+                "response": "Already exists in Wodely",
+            })
+            continue
+
         response = requests.post(url, json=payload, headers=headers, timeout=120)
         try:
             body = response.json()
@@ -894,7 +949,7 @@ def push_preview_to_wodely(df: pd.DataFrame) -> dict[str, Any]:
 
         row = {
             "index": idx,
-            "orderId": payload.get("externalKey"),
+            "orderId": order_id,
             "status_code": response.status_code,
             "response": body,
         }
@@ -907,14 +962,17 @@ def push_preview_to_wodely(df: pd.DataFrame) -> dict[str, Any]:
     if failures:
         raise RuntimeError(
             f"Wodely push failed for {len(failures)} of {len(payloads)} task(s). "
-            f"Endpoint: {url}. Failures: {failures}"
+            f"Endpoint: {url}. Failures: {failures}. Skipped: {skipped}"
         )
 
     return {
         "ok": True,
         "endpoint": url,
         "payload_count": len(payloads),
+        "created_count": len(successes),
+        "skipped_count": len(skipped),
         "successes": successes,
+        "skipped": skipped,
         "payload_preview": payloads[:3],
     }
 
