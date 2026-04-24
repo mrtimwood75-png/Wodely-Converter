@@ -16,7 +16,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v12-transforma-phone-fallback"
+APP_VERSION = "2026-04-24-v13-transforma-first-contact-mobile"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -673,18 +673,36 @@ def fetch_header(order_no: str) -> dict[str, str]:
     return records[0] if records else {}
 
 
-def fetch_contact(accde: str) -> dict[str, str]:
+def fetch_contact(accde: str, contact_name: str = "") -> dict[str, str]:
     client_key = get_setting("OPTIONS_CLIENT_KEY")
     xml_body = build_request_xml(
         client_key=client_key,
         table_name="DRSCON",
-        fields=["ACCDE", "MOBILE", "EMAIL"],
+        fields=["ACCDE", "NAME", "PHONE", "MOBILE", "EMAIL"],
         conditions=[("ACCDE", "equals", clean(accde))],
-        sort_by="ACCDE",
-        max_records=1,
+        sort_by="NAME",
+        max_records=20,
     )
     records = parse_table_records(post_options_xml(xml_body), "DRSCON")
-    return records[0] if records else {}
+    if not records:
+        return {}
+
+    wanted = clean(contact_name).lower()
+
+    if wanted:
+        for record in records:
+            if clean(record.get("NAME")).lower() == wanted:
+                return record
+
+    for record in records:
+        if clean(record.get("MOBILE")):
+            return record
+
+    for record in records:
+        if clean(record.get("PHONE")):
+            return record
+
+    return records[0]
 
 
 def extract_phone_from_text(*values: Any) -> str:
@@ -720,6 +738,7 @@ def map_lines_to_preview_rows(order_no: str, lines: list[dict[str, str]], header
     recipient_name = clean(header.get("DELNAME")) or clean(header.get("CUSTNAME"))
     phone = first_non_blank([
         contact.get("MOBILE"),
+        contact.get("PHONE"),
         extract_phone_from_text(
             header.get("CONTACT"),
             header.get("DELNOTE"),
@@ -780,9 +799,10 @@ def fetch_transforma_options_preview(from_date: str | None = None) -> pd.DataFra
         if not header:
             continue
         accde = clean(header.get("ACCDE")) or clean(order_lines[0].get("ACCDE"))
-        if accde not in contact_cache:
-            contact_cache[accde] = fetch_contact(accde) if accde else {}
-        preview_rows.extend(map_lines_to_preview_rows(order_no, order_lines, header, contact_cache.get(accde, {})))
+        contact_key = f"{accde}|{clean(header.get('CONTACT'))}"
+        if contact_key not in contact_cache:
+            contact_cache[contact_key] = fetch_contact(accde, header.get("CONTACT")) if accde else {}
+        preview_rows.extend(map_lines_to_preview_rows(order_no, order_lines, header, contact_cache.get(contact_key, {})))
     return prepare_preview_df(pd.DataFrame(preview_rows)) if preview_rows else empty_preview_df()
 
 
