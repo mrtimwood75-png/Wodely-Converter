@@ -16,7 +16,7 @@ import streamlit as st
 
 st.set_page_config(page_title="Delivery to Wodely", layout="wide")
 
-APP_VERSION = "2026-04-24-v11-remove-contact-name"
+APP_VERSION = "2026-04-24-v12-transforma-phone-fallback"
 
 OUTPUT_COLUMNS = [
     "COD (money)",
@@ -687,6 +687,27 @@ def fetch_contact(accde: str) -> dict[str, str]:
     return records[0] if records else {}
 
 
+def extract_phone_from_text(*values: Any) -> str:
+    combined = " ".join(clean(value) for value in values if clean(value))
+
+    # Australian mobile: 04xx xxx xxx, with optional spaces.
+    mobile_match = re.search(r"\b04\d{2}\s?\d{3}\s?\d{3}\b", combined)
+    if mobile_match:
+        return re.sub(r"\s+", "", mobile_match.group(0))
+
+    # Australian landline: 0[2378] xxxx xxxx, with optional spaces.
+    landline_match = re.search(r"\b0[2378]\s?\d{4}\s?\d{4}\b", combined)
+    if landline_match:
+        return re.sub(r"\s+", "", landline_match.group(0))
+
+    # Fallback: any 8 to 12 digit phone-like number.
+    generic_match = re.search(r"\b\d[\d\s]{7,14}\d\b", combined)
+    if generic_match:
+        return re.sub(r"\s+", "", generic_match.group(0))
+
+    return ""
+
+
 def map_lines_to_preview_rows(order_no: str, lines: list[dict[str, str]], header: dict[str, str], contact: dict[str, str]) -> list[dict[str, Any]]:
     if not lines:
         return []
@@ -697,7 +718,17 @@ def map_lines_to_preview_rows(order_no: str, lines: list[dict[str, str]], header
 
     customer_account = clean(header.get("ACCDE")) or clean(lines[0].get("ACCDE"))
     recipient_name = clean(header.get("DELNAME")) or clean(header.get("CUSTNAME"))
-    phone = clean(contact.get("MOBILE"))
+    phone = first_non_blank([
+        contact.get("MOBILE"),
+        extract_phone_from_text(
+            header.get("CONTACT"),
+            header.get("DELNOTE"),
+            header.get("NOTES"),
+            header.get("SETUPNOTE"),
+            header.get("MAINTNOTE"),
+            header.get("IMESS"),
+        ),
+    ])
     email = clean(contact.get("EMAIL"))
     full_address = join_non_blank([header.get("DEL1"), header.get("DEL2"), header.get("DEL3"), header.get("DEL4")])
     notes = "\n".join([p for p in [clean_multiline(header.get("DELNOTE")), clean_multiline(header.get("NOTES")), clean_multiline(header.get("SETUPNOTE")), clean_multiline(header.get("MAINTNOTE")), clean_multiline(header.get("IMESS"))] if p])
